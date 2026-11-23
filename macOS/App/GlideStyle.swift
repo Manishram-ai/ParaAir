@@ -18,14 +18,17 @@ enum Glide {
     /// least 4.5:1 on the paper and on the grouped rows in both modes.
     static let quiet = adaptive(dark: 0xB1B3B0, light: 0x5C6162)
 
-    /// The call-to-action fill and its label (--accent, --accent-ink): sage on charcoal in Dark
-    /// mode, charcoal on warm white in Light. 8:1 and 15:1.
-    static let accent = adaptive(dark: 0x9AC7B4, light: 0x20282C)
-    static let accentInk = adaptive(dark: 0x20282C, light: 0xF1EFE7)
-    /// Tint for native controls (switches, checkboxes, progress bars). AppKit draws white
-    /// glyphs on the tint, so Dark mode uses a deeper sage: white on it is 3.7:1, and it is
-    /// 3.3:1 against the grouped rows.
-    static let controlTint = adaptive(dark: 0x6C8B81, light: 0x20282C)
+    /// The call-to-action fill and its label. Light: charcoal with warm-white text (15:1), the
+    /// website's. Dark: a deep step of the brand sage (hue 155) with warm-white text, 4.8:1, and
+    /// 2.7:1 against the paper, so it reads as a tonal step of the mark's green beside the native
+    /// buttons rather than the website's pale sage fill, which looked like a mint sticker in a
+    /// small panel of system controls.
+    static let accent = adaptive(dark: 0x46725F, light: 0x20282C)
+    static let accentInk = adaptive(dark: 0xF1EFE7, light: 0xF1EFE7)
+    /// Tint for native controls (switches, checkboxes, progress bars): the same sage hue one step
+    /// lighter than the dark call to action, so the panel has one green. AppKit draws white glyphs
+    /// on the tint: 4.0:1, and the tint is 3.1:1 against the grouped rows and 3.7:1 on the paper.
+    static let controlTint = adaptive(dark: 0x588974, light: 0x20282C)
 
     /// Status tones, tuned to the paper: each is at least 4.3:1 on the grouped rows.
     static let good = adaptive(dark: 0x9AC7B4, light: 0x3F6B5A)
@@ -125,10 +128,13 @@ struct GlideLink: View {
     }
 }
 
-/// The one prominent action per view: sage (Dark) or charcoal (Light), the website's call-to-action
-/// colours. Its shape, height and font size are a native push button's for the same control size,
-/// so it sits in line with the native buttons beside it; the website's chamfered silhouette stays
-/// on the web. On hover a band of light crosses the face once; the button never moves.
+/// The one prominent action per view: deep sage (Dark) or charcoal (Light). Its shape, height and
+/// font size are a native push button's for the same control size (a continuous rounded rectangle,
+/// corner about a quarter of the height, as AppKit draws it), so it sits in line with the native
+/// buttons beside it; the website's chamfered silhouette stays on the web. On hover a band crosses the
+/// face once, a shade in Dark mode and a faint light in Light mode, and pressing darkens the face: the
+/// warm-white label stays at 4.5:1 or more in every state (Dark: 4.8 at rest, 5.4 mid-band, 5.4
+/// pressed; Light: 13.0 at rest, 5.9 mid-band, 13.6 pressed). The button never moves.
 struct GlideProminentButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         GlideProminentButton(configuration: configuration)
@@ -144,6 +150,7 @@ private struct GlideProminentButton: View {
     @Environment(\.isEnabled) private var isEnabled
     @Environment(\.controlSize) private var controlSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var scheme
     @State private var sweep: CGFloat = -1.2
 
     private var metrics: (font: CGFloat, horizontal: CGFloat, height: CGFloat) {
@@ -176,7 +183,7 @@ private struct GlideProminentButton: View {
 
     var body: some View {
         let metrics = self.metrics
-        let shape = Capsule()
+        let shape = RoundedRectangle(cornerRadius: (metrics.height * 0.24).rounded(), style: .continuous)
         configuration.label
             .font(.system(size: metrics.font, weight: .semibold))
             .lineLimit(1)
@@ -187,7 +194,9 @@ private struct GlideProminentButton: View {
             .overlay {
                 GeometryReader { proxy in
                     LinearGradient(stops: [.init(color: .clear, location: 0.3),
-                                           .init(color: Glide.paper.opacity(0.18), location: 0.5),
+                                           // Paper is charcoal in Dark mode (a shade, raising contrast)
+                                           // and warm white in Light mode (kept faint: 10% leaves 5.9:1).
+                                           .init(color: Glide.paper.opacity(scheme == .dark ? 0.18 : 0.10), location: 0.5),
                                            .init(color: .clear, location: 0.7)],
                                    startPoint: .leading, endPoint: .trailing)
                         .frame(width: proxy.size.width)
@@ -195,7 +204,7 @@ private struct GlideProminentButton: View {
                 }
                 .allowsHitTesting(false)
             }
-            .overlay(shape.fill(Glide.paper.opacity(configuration.isPressed && isEnabled ? 0.2 : 0)))
+            .overlay(shape.fill(Color.black.opacity(configuration.isPressed && isEnabled ? 0.18 : 0)))
             .clipShape(shape)
             .contentShape(shape)
             .onHover { inside in
