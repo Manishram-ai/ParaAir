@@ -62,6 +62,7 @@ struct ChangesReviewView: View {
         case .conflict: parts.append("Changed on another device")
         case .refused(cloud: true): parts.append("Not uploaded: your plan is read-only")
         case .refused(cloud: false): parts.append("Not uploaded: \(ownerName ?? "another Mac") took over this drive")
+        case .forbidden: parts.append("Not uploaded: your access here doesn’t allow this change")
         }
         if let folder = decision.folder { parts.append("in " + folder) }
         parts.append(ByteCountFormatter.string(fromByteCount: decision.size, countStyle: .file))
@@ -94,9 +95,12 @@ private struct ReviewRow: View {
             }
             Spacer(minLength: 8)
             if busy { ProgressView().controlSize(.small).accessibilityLabel("Working on \(decision.name)") }
-            if decision.kind == .conflict {
+            // A change refused to this member may still be welcome as a new file (a folder where members may only
+            // create), and can always be kept outside the drive.
+            if decision.kind == .conflict || decision.kind == .forbidden {
                 Button("Save My Copy As…") { actions.saveCopy(decision) }
-            } else {
+            }
+            if decision.kind != .conflict {
                 Button("Export My Copy…") { actions.export(decision) }
             }
             Button(decision.kind == .conflict ? "Keep Theirs" : "Discard Mine") { actions.discard(decision) }

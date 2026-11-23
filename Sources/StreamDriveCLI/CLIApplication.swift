@@ -12,9 +12,29 @@ final class CLIApplication {
     private let environment: [String: String]
     private let dependencies: EngineOpenDependencies
     private let system: CLISystem
+    /// Standard output for commands that stream (cat-version's bytes, changes' lines) instead of returning their output.
+    private let output: (Data) throws -> Void
+    /// Tests stop `changes --follow` after this many polls; nil follows until the process ends.
+    var maxFollowPolls: Int?
+    /// Where "Cloud Drives" is (connect --new-state-folder, and the folders setup-status looks in); tests replace it.
+    private let home: URL
     init(environment: [String: String] = ProcessInfo.processInfo.environment, dependencies: EngineOpenDependencies = .live,
-         system: CLISystem = .live) {
-        self.environment = environment; self.dependencies = dependencies; self.system = system
+         system: CLISystem = .live, output: @escaping (Data) throws -> Void = CLIApplication.writeStandardOutput,
+         home: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        self.environment = environment; self.dependencies = dependencies; self.system = system; self.output = output; self.home = home
+    }
+
+    /// Writes all of `data` to file descriptor 1, unbuffered, so each line of a followed feed reaches the reader at once.
+    static func writeStandardOutput(_ data: Data) throws {
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var written = 0
+            while written < raw.count {
+                let count = Darwin.write(STDOUT_FILENO, base.advanced(by: written), raw.count - written)
+                if count < 0 { if errno == EINTR { continue }; throw DriveError(errno, "Couldn’t write to standard output") }
+                written += count
+            }
+        }
     }
     func run(_ arguments: [String]) -> CLIExecution {
         do { return try execute(CLIParser.parse(arguments)) }
@@ -111,12 +131,23 @@ final class CLIApplication {
             if let size = values["block-size"], Int(size) != CloudDriveSetup.blockSize {
                 throw CLIUsageError(message: "ParaAir Cloud drives use --block-size 4194304")
             }
+            let accountID = values["cloud-account"]!
+            // With --new-state-folder the account may be signed in in any folder ParaAir knows; the drive gets its own.
+            var accountRoot = stateRoot, targetRoot = stateRoot, sharing: CloudAccount?
+            if arguments.newStateFolder {
+                let found = try signedInAccount(accountID, roots: [stateRoot.standardizedFileURL] + knownRoots(explicit: nil))
+                accountRoot = found.root; sharing = found.account
+                for root in knownRoots(explicit: nil) + [stateRoot.standardizedFileURL] {
+                    if let other = (try? ProfileStore(root: root).list())?.first(where: { $0.name == arguments.profile }) {
+                        throw DriveError(EEXIST, "A drive named '\(other.name)' is already saved in \(root.path); it would mount at the same place. Choose another name")
+                    }
+                }
+            }
             let drive: String
             if let wanted = values["cloud-drive-name"] {
-                let accountID = values["cloud-account"]!
-                _ = try signedInAccount(accountID, roots: [stateRoot])
+                _ = try signedInAccount(accountID, roots: [accountRoot])
                 let name = wanted.precomposedStringWithCanonicalMapping
-                let matches = try accountAPI(root: stateRoot, accountID: accountID).drives().filter { $0.name.precomposedStringWithCanonicalMapping == name }
+                let matches = try accountAPI(root: accountRoot, accountID: accountID).drives().filter { $0.name.precomposedStringWithCanonicalMapping == name }
                 guard matches.count == 1 else {
                     throw CLIOutcomeError(outcome: .driveNotFound, message: matches.isEmpty
                         ? "This account has no ParaAir Cloud drive named \(displayName(wanted))"
@@ -129,18 +160,31 @@ final class CLIApplication {
             if arguments.overwrite, let previous = try? store.load(arguments.profile), mounted(previous) {
                 throw DriveError(EBUSY, "Unmount the profile before replacing its configuration")
             }
-            var profile = try CloudDriveSetup.attach(driveID: drive, finderName: arguments.profile, name: arguments.profile,
-                                                     accountID: values["cloud-account"]!, stateRoot: stateRoot,
+            if let sharing { targetRoot = try CloudDriveSetup.newStateRoot(sharing: sharing, vault: dependencies.cloudVault, home: home) }
+            let targetStore = ProfileStore(root: targetRoot)
+            var profile: DriveProfile
+            do {
+                profile = try CloudDriveSetup.attach(driveID: drive, finderName: arguments.profile, name: arguments.profile,
+                                                     accountID: accountID, stateRoot: targetRoot,
                                                      replace: arguments.overwrite, dependencies: dependencies)
-            if values["cache-mib"] != nil || values["min-free-mib"] != nil || values["journal-mib"] != nil || values["mount-point"] != nil {
+            } catch {
+                // Only the folder this command just made goes; it holds nothing but the account record.
+                if sharing != nil { try? FileManager.default.removeItem(at: targetRoot) }
+                throw error
+            }
+            if values["cache-mib"] != nil || values["min-free-mib"] != nil || values["journal-mib"] != nil || values["mount-point"] != nil
+                || arguments.conflictCopies {
+                if arguments.conflictCopies { profile.conflictCopies = true }
                 profile.cacheLimitBytes = try bytes(values["cache-mib"], default: profile.cacheLimitBytes)
                 profile.minFreeBytes = try bytes(values["min-free-mib"], default: profile.minFreeBytes)
                 profile.maxJournalBytes = try bytes(values["journal-mib"], default: profile.maxJournalBytes)
                 profile.mountPoint = values["mount-point"].map(absolutePath) ?? profile.mountPoint
-                try store.save(profile, overwrite: true)
+                try targetStore.save(profile, overwrite: true)
             }
-            let response = ProfileReference(profile: profile.name, backend: profile.backend.rawValue, mountPoint: profile.mountPoint, mounted: false)
-            return try render(response, invocation: invocation, text: "Saved ParaAir Cloud profile '\(profile.name)'. Run ls to browse it, then mount to open it in Finder.\n")
+            let response = ProfileReference(profile: profile.name, backend: profile.backend.rawValue, mountPoint: profile.mountPoint, mounted: false,
+                                            stateDirectory: targetRoot.standardizedFileURL.path)
+            return try render(response, invocation: invocation, text: "Saved ParaAir Cloud profile '\(profile.name)' in \(displayName(targetRoot.path)). "
+                              + "Run ls to browse it, then mount to open it in Finder\(sharing == nil ? "" : " (pass --state-dir \(displayName(targetRoot.path)))").\n")
         case .connect(let arguments):
             let values = arguments.values
             let fixture = values["fixture-root"].map(absolutePath)
@@ -169,6 +213,7 @@ final class CLIApplication {
                 maxJournalBytes: try bytes(values["journal-mib"], default: 4_294_967_296),
                 credentialID: values["credential-id"], connectionID: values["connection"]
             )
+            if arguments.conflictCopies { profile.conflictCopies = true }
             let previous = arguments.overwrite ? try? store.load(arguments.profile) : nil
             if let previous, mounted(previous) {
                 throw DriveError(EBUSY, "Unmount the profile before replacing its configuration")
@@ -245,6 +290,90 @@ final class CLIApplication {
                 message = "Exported this Mac's copy to \(displayName(destination.path)) and removed it from the drive.\n"
             }
             return try render(result, invocation: invocation, text: message)
+        case .settings(let name, let conflictCopies):
+            var profile = try store.load(name)
+            if let conflictCopies, conflictCopies != (profile.conflictCopies ?? false) {
+                profile.conflictCopies = conflictCopies
+                try store.save(profile, overwrite: true)
+            }
+            let isMounted = mounted(profile)
+            let value = SettingsResult(profile: name, conflictCopies: profile.conflictCopies ?? false, mounted: isMounted,
+                                       appliesAtNextMount: conflictCopies != nil && isMounted)
+            return try render(value, invocation: invocation, text: "Conflict copies: \(value.conflictCopies ? "on" : "off")."
+                              + (value.appliesAtNextMount ? " The mounted drive keeps its setting until it is mounted again." : "") + "\n")
+        case .versions(let target, let before, let limit):
+            let resolved = try resolve(target, invocation: invocation)
+            let page = try collaboration {
+                try cloudAPI(cloudOnly(resolved.profile), root: resolved.root)
+                    .versions(driveID: resolved.profile.cloudDriveID!, path: resolved.path, before: before, limit: limit ?? 100)
+            }
+            var text = page.versions.map { version in
+                "\(version.version)\t\(version.size)\t\(version.createdAt)\t\(displayName(version.author.email ?? version.author.name ?? "-"))\(version.current ? "\tcurrent" : "")"
+            }.joined(separator: "\n")
+            text = text.isEmpty ? "No versions kept.\n" : text + "\n"
+            if let next = page.nextBefore { text += "More: --before \(next)\n" }
+            return try render(page, invocation: invocation, text: text)
+        case .catVersion(let target, let version):
+            let resolved = try resolve(target, invocation: invocation)
+            let profile = try cloudOnly(resolved.profile)
+            try collaboration {
+                // The version must be one of this file's: the newest version below version + 1 is that version or none.
+                let number = Int64(version.dropFirst(3))!
+                let page = try cloudAPI(profile, root: resolved.root).versions(driveID: profile.cloudDriveID!, path: resolved.path, before: number + 1, limit: 1)
+                guard let found = page.versions.first, found.version == version else {
+                    throw CLIOutcomeError(outcome: .notFound, message: "\(version) isn’t a kept version of \(displayName(resolved.path)) (see versions)")
+                }
+                let engine = try open(profile, root: resolved.root)
+                var offset: Int64 = 0
+                while offset < found.size {
+                    let piece = try engine.readVersion(resolved.path, version: version, offset: offset, length: Int(min(found.size - offset, 8 << 20)))
+                    guard !piece.isEmpty else { throw DriveError(EIO, "The version is shorter than its history says") }
+                    try output(piece)
+                    offset += Int64(piece.count)
+                }
+            }
+            return CLIExecution(stdout: "", stderr: "", exitCode: 0)
+        case .restoreVersion(let target, let version, let expected):
+            let resolved = try resolve(target, invocation: invocation)
+            let profile = try cloudOnly(resolved.profile)
+            let entry = try collaboration {
+                try cloudAPI(profile, root: resolved.root).restoreVersion(driveID: profile.cloudDriveID!, path: resolved.path, version: version,
+                                                                         expectedVersion: expected, idempotencyKey: UUID())
+            }
+            // This Mac shows the restored contents at once; other Macs learn of it from the change feed.
+            try? open(profile, root: resolved.root).noteStorageChanged(resolved.path)
+            let value = RestoreVersionResult(path: entry.path, restoredVersion: version, version: entry.version, size: entry.size)
+            return try render(value, invocation: invocation, text: "Restored \(version) of \(displayName(entry.path)) as \(entry.version).\n")
+        case .conflictInfo(let target):
+            let resolved = try resolve(target, invocation: invocation)
+            let info = try collaboration { try open(resolved.profile, root: resolved.root).conflictCopyInfo(resolved.path) }
+            guard let info else {
+                throw CLIOutcomeError(outcome: .notFound, message: "\(displayName(resolved.path)) isn’t a known conflict copy")
+            }
+            return try render(info, invocation: invocation,
+                              text: "Copy of \(displayName(info.original)): based on \(info.baseVersion ?? "a new file"), lost to \(info.theirsVersion ?? "an unknown version").\n")
+        case .changes(let target, let follow, let since, let interval):
+            let resolved = try resolve(target, invocation: invocation)
+            return try changes(resolved, follow: follow, since: since, interval: interval ?? 3, json: invocation.json)
+        case .access(let action, let target):
+            let resolved = try resolve(target, invocation: invocation)
+            let profile = try cloudOnly(resolved.profile)
+            let api = try cloudAPI(profile, root: resolved.root), drive = profile.cloudDriveID!, folder = resolved.path
+            switch action {
+            case .list:
+                // Rules on the folder, around it and inside it: everything that decides access there.
+                let rules = try api.accessRules(driveID: drive).filter { folder == "/" || within($0.path, folder) || within(folder, $0.path) }
+                let text = rules.map { "\($0.path)\t\(principalText($0))\t\($0.access)" }.joined(separator: "\n")
+                return try render(AccessList(path: folder, rules: rules), invocation: invocation, text: text.isEmpty ? "No folder rules.\n" : text + "\n")
+            case .set(let principal, let level):
+                let rule = try api.setAccess(driveID: drive, principal: principal, path: folder, access: level)
+                return try render(AccessSet(rule: rule), invocation: invocation, text: "\(principalText(rule)) now has \(rule.access) access at \(displayName(rule.path)).\n")
+            case .remove(let principal):
+                try api.removeAccess(driveID: drive, principal: principal, path: folder)
+                let field = principalField(principal)
+                return try render(AccessRemoved(path: folder, principal: [field.name: field.value], removed: true), invocation: invocation,
+                                  text: "Removed the rule for \(displayName(field.value)) at \(displayName(folder)).\n")
+            }
         case .mount(let name, let override, let wait):
             var profile = try store.load(name)
             guard !mounted(profile) else { throw DriveError(EBUSY, "This profile is already mounted; unmount it before choosing another mount point") }
@@ -311,8 +440,11 @@ final class CLIApplication {
         var roots = [base]
         let appPath = absolutePath(Self.applicationPath(environment: environment))
         let bundleID = system.appInfo(appPath)?.bundleID ?? ParaAirBundle.releaseApp
-        for path in system.appStateFolders(bundleID) {
-            let url = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        // The app's folders, then those under "Cloud Drives" it hasn't learned yet (connect --new-state-folder).
+        let cloudDrives = (try? FileManager.default.contentsOfDirectory(at: CloudDriveSetup.cloudDrivesFolder(home: home), includingPropertiesForKeys: nil)) ?? []
+        for url in system.appStateFolders(bundleID).map({ URL(fileURLWithPath: $0, isDirectory: true) })
+            + cloudDrives.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let url = url.standardizedFileURL
             var isDirectory: ObjCBool = false
             if !roots.contains(url), FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue { roots.append(url) }
         }
@@ -357,6 +489,7 @@ final class CLIApplication {
                                   running: info?.bundleID.map(system.isRunning) ?? false, version: info?.version, build: info?.build)
         let state = info == nil ? "notDiscovered" : system.extensionState(appPath, info?.bundleID)
         let roots = knownRoots(explicit: explicit)
+        let appFolders = Set(system.appStateFolders(info?.bundleID ?? ParaAirBundle.releaseApp).map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path })
         let profiles = roots.flatMap { root -> [SetupStatus.Profile] in
             ((try? ProfileStore(root: root).list()) ?? []).map { profile in
                 let isMounted = mounted(profile)
@@ -367,7 +500,8 @@ final class CLIApplication {
                 return SetupStatus.Profile(profile: profile.name, stateDirectory: root.path, backend: profile.backend.rawValue,
                                            cloudAccountId: profile.cloudAccountID, cloudDriveId: profile.cloudDriveID,
                                            workspaceId: profile.cloudWorkspaceID, mountPoint: profile.mountPoint, mounted: isMounted,
-                                           healthy: healthy)
+                                           healthy: healthy, conflictCopies: profile.conflictCopies ?? false,
+                                           knownToApp: appFolders.contains(root.standardizedFileURL.path))
             }
         }
         return SetupStatus(app: app, extension: .init(state: state), accounts: accountItems(roots), profiles: profiles)
@@ -419,6 +553,115 @@ final class CLIApplication {
         return try render(ProfileReference(profile: profile.name, backend: profile.backend.rawValue, mountPoint: point, mounted: true),
                           invocation: invocation, text: "Mounted '\(profile.name)' at \(point).\n")
     }
+    // MARK: Shared editing (versions, change feed, conflict copies, folder rules)
+
+    private struct ResolvedTarget { var profile: DriveProfile; var root: URL; var path: String }
+
+    /// The profile, state folder and drive path a target names. A mounted path picks the mounted ParaAir drive that
+    /// contains it, then the profile mounted there in the known state folders (or, failing that, the profile named
+    /// like the volume, as the app mounts drives at /Volumes/<Finder name>).
+    private func resolve(_ target: CLITarget, invocation: CLIInvocation) throws -> ResolvedTarget {
+        switch target {
+        case .drive(let name, let path):
+            let root = ProfileStore.resolveRoot(explicit: invocation.stateDirectory, environment: environment)
+            return ResolvedTarget(profile: try ProfileStore(root: root).load(name), root: root, path: try canonicalPath(path))
+        case .mounted(let value):
+            let full = URL(fileURLWithPath: (value as NSString).expandingTildeInPath).standardizedFileURL.path
+            let volume = system.mountedVolumes().filter { $0.isStreamDrive && (full == $0.mountPoint || full.hasPrefix($0.mountPoint + "/")) }
+                .max { $0.mountPoint.utf8.count < $1.mountPoint.utf8.count }
+            guard let volume else {
+                throw CLIOutcomeError(outcome: .notMounted, message: "\(displayName(value)) isn’t on a mounted ParaAir drive")
+            }
+            let candidates = knownRoots(explicit: invocation.stateDirectory).flatMap { root in
+                ((try? ProfileStore(root: root).list()) ?? []).map { (root: root, profile: $0) }
+            }
+            let volumeName = (volume.mountPoint as NSString).lastPathComponent
+            guard let found = candidates.first(where: { $0.profile.mountPoint == volume.mountPoint })
+                    ?? candidates.first(where: { ($0.profile.finderName == volumeName || $0.profile.name == volumeName) && $0.profile.mountPoint == nil }) else {
+                throw CLIOutcomeError(outcome: .notMounted, message: "No ParaAir profile in the known state folders is mounted at \(displayName(volume.mountPoint)); pass --state-dir")
+            }
+            let rest = String(full.dropFirst(volume.mountPoint.count))
+            return ResolvedTarget(profile: found.profile, root: found.root, path: try canonicalPath(rest.isEmpty ? "/" : rest))
+        }
+    }
+
+    private func cloudOnly(_ profile: DriveProfile) throws -> DriveProfile {
+        guard profile.backend == .paraairCloud else { throw CLIUsageError(message: "Only ParaAir Cloud drives keep versions, a change feed and folder rules") }
+        return profile
+    }
+
+    /// Version conflicts and missing files, versions or copies get exit codes of their own here.
+    private func collaboration<T>(_ body: () throws -> T) throws -> T {
+        do { return try body() }
+        catch let error as DriveError where error.code == ESTALE { throw CLIOutcomeError(outcome: .versionConflict, message: error.message) }
+        catch let error as DriveError where error.code == ENOENT { throw CLIOutcomeError(outcome: .notFound, message: error.message) }
+    }
+
+    /// `changes`: with --json one JSON object per line, as the service sends each change; a `reset` line when changes
+    /// were pruned (rescan, then follow on); with --follow, first a `following` line with the cursor it starts from.
+    /// Each page's paths are dropped from this Mac's caches first, so reading them through the mount right after a line
+    /// gets the new contents. Only changes at or under the target's folder are printed.
+    private func changes(_ resolved: ResolvedTarget, follow: Bool, since: Int64?, interval: Int, json: Bool) throws -> CLIExecution {
+        let engine = try open(cloudOnly(resolved.profile), root: resolved.root), folder = resolved.path
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        func emit<T: Encodable>(_ value: T, text: String) throws {
+            try output(json ? try encoder.encode(value) + Data("\n".utf8) : Data((text + "\n").utf8))
+        }
+        func shows(_ change: ParaAirCloudChange) -> Bool {
+            folder == "/" || within(change.path, folder) || change.fromPath.map { within($0, folder) } ?? false
+        }
+        var cursor: Int64
+        if let since { cursor = since }
+        else {
+            cursor = try engine.readChanges(since: nil).cursor
+            if !follow {
+                try emit(FeedCursor(cursor: cursor), text: "Cursor \(cursor). Pass --since \(cursor) later to see what changed after now.")
+                return CLIExecution(stdout: "", stderr: "", exitCode: 0)
+            }
+        }
+        if follow { try emit(FeedStart(following: true, cursor: cursor), text: "Following changes from cursor \(cursor).") }
+        var polls = 0, failures = 0
+        while true {
+            let page: ParaAirCloudChangePage
+            do { page = try engine.readChanges(since: cursor) ; failures = 0 }
+            catch let error as DriveError where follow && Self.passing(error) {
+                // Offline or the service is busy: keep following, waiting longer each time, up to a minute.
+                failures += 1
+                system.sleep(TimeInterval(min(60, interval << min(failures, 5))))
+                continue
+            }
+            if page.reset { try emit(FeedReset(reset: true, cursor: page.cursor), text: "Changes were pruned: rescan, then follow from cursor \(page.cursor).") }
+            for change in page.changes where shows(change) {
+                try emit(change, text: "\(change.cursor)\t\(change.change)\t\(change.kind)\t\(displayName(change.fromPath.map { $0 + " -> " } ?? ""))\(displayName(change.path))")
+            }
+            cursor = page.cursor
+            if page.more { continue }
+            guard follow else { return CLIExecution(stdout: "", stderr: "", exitCode: 0) }
+            polls += 1
+            if let limit = maxFollowPolls, polls >= limit { return CLIExecution(stdout: "", stderr: "", exitCode: 0) }
+            system.sleep(TimeInterval(interval))
+        }
+    }
+
+    /// Failures a followed feed waits out: no connection, timeouts and the service being briefly unavailable.
+    private static func passing(_ error: DriveError) -> Bool {
+        [EIO, EAGAIN, EBUSY, ENETDOWN, ENETUNREACH, EHOSTUNREACH, ECONNRESET, ECONNREFUSED, ETIMEDOUT, ENOTCONN].contains(error.code)
+    }
+
+    private func within(_ path: String, _ folder: String) -> Bool { folder == "/" || path == folder || path.hasPrefix(folder + "/") }
+    private func principalText(_ rule: ParaAirCloudAccessRule) -> String {
+        if let role = rule.role { return "role:" + role }
+        if let credential = rule.credential { return "credential:" + credential + (rule.name.map { " (\(displayName($0)))" } ?? "") }
+        return displayName(rule.email ?? rule.userId ?? "-")
+    }
+    private func principalField(_ principal: ParaAirCloudAccessPrincipal) -> (name: String, value: String) {
+        switch principal {
+        case .email(let value): return ("email", value)
+        case .role(let value): return ("role", value)
+        case .credential(let value): return ("credential", value)
+        }
+    }
+
     private func cloudProfile(_ name: String, store: ProfileStore) throws -> DriveProfile {
         let profile = try store.load(name)
         guard profile.backend == .paraairCloud else { throw CLIUsageError(message: "trash and restore apply only to ParaAir Cloud profiles") }
@@ -576,13 +819,20 @@ struct SetupStatus: Encodable {
         var profile: String; var stateDirectory: String; var backend: String
         var cloudAccountId: String?; var cloudDriveId: String?; var workspaceId: String?
         var mountPoint: String?; var mounted: Bool; var healthy: Bool
+        var conflictCopies: Bool
+        /// Whether the app has learned this state folder (it mounts its drive at login); a mount request teaches it.
+        var knownToApp: Bool
     }
     var app: App
     var `extension`: Extension
     var accounts: [Account]
     var profiles: [Profile]
 }
-private struct ProfileReference: Encodable { var profile: String; var backend: String; var mountPoint: String?; var mounted: Bool }
+private struct ProfileReference: Encodable {
+    var profile: String; var backend: String; var mountPoint: String?; var mounted: Bool
+    /// The state folder, for a drive attached in one of its own (connect --new-state-folder).
+    var stateDirectory: String? = nil
+}
 private struct ProfileStatus: Encodable { var profile: String; var backend: String; var mountPoint: String?; var mounted: Bool; var connectionState: String; var drive: DriveStatus }
 private struct CacheResult: Encodable { var profile: String; var evictedBytes: Int64; var drive: DriveStatus }
 private struct PinResult: Encodable { var profile: String; var path: String; var pinned: Bool; var drive: DriveStatus }
@@ -591,5 +841,13 @@ private struct ResolveResult: Encodable {
     var profile: String; var path: String; var resolution: String
     var copyPath: String?; var uploaded: Bool?; var exportedTo: String?
 }
+private struct SettingsResult: Encodable { var profile: String; var conflictCopies: Bool; var mounted: Bool; var appliesAtNextMount: Bool }
+private struct RestoreVersionResult: Encodable { var path: String; var restoredVersion: String; var version: String; var size: Int64 }
+private struct AccessList: Encodable { var path: String; var rules: [ParaAirCloudAccessRule] }
+private struct AccessSet: Encodable { var rule: ParaAirCloudAccessRule }
+private struct AccessRemoved: Encodable { var path: String; var principal: [String: String]; var removed: Bool }
+private struct FeedCursor: Encodable { var cursor: Int64 }
+private struct FeedStart: Encodable { var following: Bool; var cursor: Int64 }
+private struct FeedReset: Encodable { var reset: Bool; var cursor: Int64 }
 private struct DoctorCheck: Encodable { var name: String; var state: String; var detail: String }
 private struct DoctorResult: Encodable { var stateDirectory: String; var profiles: [String]; var checks: [DoctorCheck] }
