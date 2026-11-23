@@ -7,6 +7,23 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <description>ParaAir updates</description>
     <language>en</language>
     <item>
+      <title>ParaAir 0.1.0 alpha 4</title>
+      <pubDate>Mon, 23 Nov 2026 12:57:05 GMT</pubDate>
+      <sparkle:version>35</sparkle:version>
+      <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+      <sparkle:fullReleaseNotesLink>https://github.com/parafieldai/ParaAir/releases/tag/v0.1.0-alpha.4</sparkle:fullReleaseNotesLink>
+      <description><![CDATA[<ul>
+<li>ParaAir Cloud sign-in in Storage Settings. It is invite-only for now: only accounts added to a workspace can sign in.</li>
+<li>Shared drives: when two Macs save the same file, the losing save is kept beside it as a conflict copy instead of being lost. Version history with restore, and Finder sees changes from other Macs sooner.</li>
+<li>An upload that the drive's folder rules refuse waits for your decision instead of retrying forever.</li>
+<li>Other apps can set ParaAir up: the <code>paraair</code> command line gains setup, version history, change feed and folder rule commands.</li>
+<li>Calmer dark mode: one sage green, buttons shaped like the macOS buttons beside them, readable labels while hovered and pressed.</li>
+</ul>
+]]></description>
+      <enclosure url="https://github.com/parafieldai/ParaAir/releases/download/v0.1.0-alpha.4/ParaAir-0.1.0-alpha.4.zip" length="49046587" type="application/octet-stream" sparkle:edSignature="8lRQibAesbClNib4DgEQtkYXy1DsP7dqK/GqdyXyVizLU3mwYn2T8XszIpow1GxdCPpWP9XrnPL186wvC1bMCQ=="/>
+    </item>
+    <item>
       <title>ParaAir 0.1.0 alpha 3</title>
       <pubDate>Fri, 16 Oct 2026 11:14:22 GMT</pubDate>
       <sparkle:version>21</sparkle:version>
@@ -43,6 +60,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
   </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: ZHTwGTbBuChkMOYsqQyaHf6hFMcpklJGnUssPMWfgnKyFGCFZ52RgamTmm8NyldkRYIlrQ1bUrn2OXBuAmWkBg==
-length: 3116
+edSignature: xWA8gFGx/NuzkVHkh+oXxRkrIAgHtk6oqV7elqOX65srmRViPw94iBnBS3RKGnZiaHWRJCxtFO8rFigyLlVxBg==
+length: 4628
 -->
