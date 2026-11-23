@@ -148,10 +148,32 @@ public final class ParaAirCloudHTTP: NSObject, URLSessionDataDelegate, @unchecke
         items.map { encodeComponent($0.name) + "=" + encodeComponent($0.value ?? "") }.joined(separator: "&")
     }
     static func encodeComponent(_ value: String) -> String {
-        value.addingPercentEncoding(withAllowedCharacters: queryAllowed)!
+        var out = ""
+        out.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            if isUnreservedOrSlash(byte) { out.unicodeScalars.append(Unicode.Scalar(byte)) }
+            else { out += "%" + String(byte, radix: 16, uppercase: true).leftPadded(to: 2) }
+        }
+        return out
     }
-    private static let queryAllowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")
-    private static let pathAllowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")
+    /// `A–Z a–z 0–9 - . _ ~ /`, by byte. These checks don't use CharacterSet: in alpha.4's app (build 35) a static
+    /// CharacterSet refused the constant path "/v1/me", which a test process accepted (fix/cloud-sign-in-state-folder).
+    static func isUnreservedOrSlash(_ byte: UInt8) -> Bool {
+        (0x41...0x5A).contains(byte) || (0x61...0x7A).contains(byte) || (0x30...0x39).contains(byte)
+            || byte == 0x2D || byte == 0x2E || byte == 0x5F || byte == 0x7E || byte == 0x2F
+    }
+    /// Nil for a path the client may send: it begins with one "/", has only unreserved characters and "/", and no
+    /// "/../". Otherwise which rule it breaks, for the log: never the path itself.
+    static func pathProblem(_ path: String) -> String? {
+        let bytes = Array(path.utf8)
+        guard bytes.first == 0x2F else { return "path doesn't start with / (\(bytes.count) bytes)" }
+        if bytes.count > 1, bytes[1] == 0x2F { return "path starts with //" }
+        if let index = bytes.firstIndex(where: { !isUnreservedOrSlash($0) }) {
+            return "path byte \(index) of \(bytes.count) is 0x\(String(bytes[index], radix: 16, uppercase: true).leftPadded(to: 2))"
+        }
+        if path.contains("/../") || path.hasSuffix("/..") { return "path has /../" }
+        return nil
+    }
     /// The app's main thread must never wait on the network; the CLI and tests may.
     static var forbidsMainThread: Bool { ParaAirBundle.isApp }
     static let offlineClass: Set<Int32> = [ENETDOWN, ENETUNREACH, EHOSTUNREACH, ECONNREFUSED, ECONNRESET, ETIMEDOUT, ENOTCONN]
@@ -175,16 +197,19 @@ public final class ParaAirCloudHTTP: NSObject, URLSessionDataDelegate, @unchecke
     @discardableResult
     private func start(_ request: Request, bearer: String?, completion: @escaping (Result<Response, DriveError>) -> Void) -> URLSessionTask? {
         let route = request.route ?? request.method
-        guard request.path.hasPrefix("/"), !request.path.hasPrefix("//"),
-              request.path.unicodeScalars.allSatisfy(Self.pathAllowed.contains), !request.path.contains("/../"),
-              request.method.range(of: "^[A-Z]{3,7}$", options: .regularExpression) != nil,
-              request.maxResponseBytes > 0, bearer.map(Self.validBearer) ?? true else {
-            completion(.failure(DriveError(EINVAL, "Invalid ParaAir Cloud request", disposition: .attemptNotDispatched))); return nil
+        // A request refused before it is sent names the check that refused it, in the log and the message, never a
+        // value: such a refusal leaves no other trace.
+        func refuse(_ check: String) -> URLSessionTask? {
+            Self.logger.error("\(route, privacy: .public) refused before sending: \(check, privacy: .public)")
+            completion(.failure(DriveError(EINVAL, "Invalid ParaAir Cloud request (\(check))", disposition: .attemptNotDispatched)))
+            return nil
         }
+        if let problem = Self.pathProblem(request.path) { return refuse(problem) }
+        guard request.method.range(of: "^[A-Z]{3,7}$", options: .regularExpression) != nil else { return refuse("method") }
+        guard request.maxResponseBytes > 0 else { return refuse("size") }
+        if let bearer, !Self.validBearer(bearer) { return refuse(Self.bearerProblem(bearer)) }
         let query = request.query.isEmpty ? "" : "?" + Self.encodeQuery(request.query)
-        guard let url = URL(string: baseURL.absoluteString + request.path + query) else {
-            completion(.failure(DriveError(EINVAL, "Invalid ParaAir Cloud request", disposition: .attemptNotDispatched))); return nil
-        }
+        guard let url = URL(string: baseURL.absoluteString + request.path + query) else { return refuse("address") }
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = request.method
         urlRequest.timeoutInterval = min(request.timeout ?? .infinity, session.configuration.timeoutIntervalForRequest)
@@ -222,6 +247,14 @@ public final class ParaAirCloudHTTP: NSObject, URLSessionDataDelegate, @unchecke
 
     private static func validBearer(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 4096 && value.utf8.allSatisfy { (0x21...0x7e).contains($0) }
+    }
+    /// Which rule a token breaks, for the log: its shape only, never its characters.
+    static func bearerProblem(_ value: String) -> String {
+        if value.isEmpty { return "token empty" }
+        if value.utf8.count > 4096 { return "token longer than 4096 bytes" }
+        if value.utf8.contains(where: { $0 == 0x20 || $0 == 0x09 || $0 == 0x0a || $0 == 0x0d }) { return "token has whitespace (\(value.utf8.count) bytes)" }
+        if value.utf8.contains(where: { $0 < 0x20 || $0 == 0x7f }) { return "token has control characters (\(value.utf8.count) bytes)" }
+        return "token has non-ASCII characters (\(value.utf8.count) bytes)"
     }
 
     private func take(_ task: URLSessionTask?) -> Pending? {
@@ -323,4 +356,8 @@ public enum ParaAirCloudBlocking {
             queue.async { continuation.resume(with: Result { try body() }) }
         }
     }
+}
+
+private extension String {
+    func leftPadded(to width: Int) -> String { count >= width ? self : String(repeating: "0", count: width - count) + self }
 }

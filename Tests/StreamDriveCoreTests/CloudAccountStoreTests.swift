@@ -112,4 +112,65 @@ final class CloudAccountStoreTests: XCTestCase {
         XCTAssertEqual(other.root, CloudDriveSetup.defaultStateRoot(accountID: other.accountID, home: home))
         XCTAssertTrue(FileManager.default.fileExists(atPath: other.root.path))
     }
+
+    func testAFolderWithAProfileThatDoesNotLoadDoesNotStopSignIn() throws {
+        let current = try cloudTestRoot(self), home = try cloudTestRoot(self)
+        // A profile file whose name doesn't match the profile in it: ProfileStore.list() refuses the whole folder.
+        let profiles = current.appendingPathComponent("profiles", isDirectory: true)
+        try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+        let data = current.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
+        try JSONEncoder().encode(DriveProfile(name: "E2E", backend: .local, localRoot: data.path, minFreeBytes: 0))
+            .write(to: profiles.appendingPathComponent("E2E-2.json"))
+        XCTAssertThrowsError(try ProfileStore(root: current).list())
+        let chosen = try ParaAirCloudSignIn.chooseRoot(issuer: issuer, userID: user(), current: current, home: home)
+        XCTAssertTrue(chosen.created)
+        XCTAssertEqual(chosen.root, CloudDriveSetup.defaultStateRoot(accountID: chosen.accountID, home: home))
+    }
+
+    func testARequestRefusedBeforeSendingNamesTheCheckButNeverTheToken() throws {
+        XCTAssertEqual(ParaAirCloudHTTP.bearerProblem(""), "token empty")
+        XCTAssertEqual(ParaAirCloudHTTP.bearerProblem("pca_abc def"), "token has whitespace (11 bytes)")
+        XCTAssertEqual(ParaAirCloudHTTP.bearerProblem("pca_abc\u{1}"), "token has control characters (8 bytes)")
+        XCTAssertEqual(ParaAirCloudHTTP.bearerProblem("pca_é"), "token has non-ASCII characters (6 bytes)")
+        let http = try ParaAirCloudHTTP(baseURL: URL(string: "https://refused.cloud.invalid")!, policy: .init(allowsLoopbackHTTP: false))
+        defer { http.invalidate() }
+        XCTAssertThrowsError(try http.sendSync(.init(method: "GET", path: "/v1/me", route: "GET /v1/me"), bearer: "pca_secret value")) {
+            let error = $0 as? DriveError
+            XCTAssertEqual(error?.code, EINVAL)
+            XCTAssertEqual(error?.message, "Invalid ParaAir Cloud request (token has whitespace (16 bytes))")
+            XCTAssertFalse(error?.message.contains("secret") ?? true)
+        }
+        XCTAssertThrowsError(try http.sendSync(.init(method: "get", path: "/v1/me"), bearer: nil)) {
+            XCTAssertEqual(($0 as? DriveError)?.message, "Invalid ParaAir Cloud request (method)")
+        }
+    }
+
+    func testPathsAndQueriesAreCheckedByteForByteLikeBefore() throws {
+        // The old rules, with CharacterSet, as a reference: the byte checks must agree with them everywhere.
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")
+        var generator = SystemRandomNumberGenerator()
+        let alphabet = Array("abcXYZ09-._~/ +&=?#%é ü中😀\u{0}\u{7f}\"'<>")
+        for _ in 0..<2000 {
+            let value = String((0..<Int.random(in: 0...24, using: &generator)).map { _ in alphabet.randomElement(using: &generator)! })
+            XCTAssertEqual(ParaAirCloudHTTP.encodeComponent(value), value.addingPercentEncoding(withAllowedCharacters: allowed)!, value)
+            let path = "/" + value
+            let old = path.hasPrefix("/") && !path.hasPrefix("//") && path.unicodeScalars.allSatisfy(allowed.contains) && !path.contains("/../")
+            // The byte rules also refuse a path ending in "/..", which the old ones let through.
+            XCTAssertEqual(ParaAirCloudHTTP.pathProblem(path) == nil, old && !path.hasSuffix("/.."), path)
+        }
+        XCTAssertNil(ParaAirCloudHTTP.pathProblem("/v1/me"))
+        XCTAssertNil(ParaAirCloudHTTP.pathProblem("/v1/drives/3f0c2a7e-6b1d-4e0a-9c2f-1d2e3f4a5b6c/stat"))
+        XCTAssertEqual(ParaAirCloudHTTP.pathProblem("v1/me"), "path doesn't start with / (5 bytes)")
+        XCTAssertEqual(ParaAirCloudHTTP.pathProblem("//v1/me"), "path starts with //")
+        XCTAssertEqual(ParaAirCloudHTTP.pathProblem("/v1/m e"), "path byte 5 of 7 is 0x20")
+        XCTAssertEqual(ParaAirCloudHTTP.pathProblem("/v1/../me"), "path has /../")
+        XCTAssertEqual(ParaAirCloudHTTP.pathProblem("/v1/.."), "path has /../")
+        let http = try ParaAirCloudHTTP(baseURL: URL(string: "https://refused.cloud.invalid")!, policy: .init(allowsLoopbackHTTP: false))
+        defer { http.invalidate() }
+        XCTAssertThrowsError(try http.sendSync(.init(method: "GET", path: "/v1/m e", route: "GET /v1/me"), bearer: nil)) {
+            XCTAssertEqual(($0 as? DriveError)?.message, "Invalid ParaAir Cloud request (path byte 5 of 7 is 0x20)")
+        }
+    }
 }
+
