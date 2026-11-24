@@ -57,9 +57,15 @@ struct CLISystem {
     var extensionState: (_ appPath: String, _ bundleID: String?) -> String
     /// State folders the app remembers (its `selectedStateRoot` and `knownStateRoots` settings).
     var appStateFolders: (_ bundleID: String) -> [String]
+    /// Other copies of the app LaunchServices has registered that still exist (OtherAppCopies.present).
+    var otherAppCopies: (_ appPath: String, _ bundleID: String?) -> [String] = { _, _ in [] }
+    /// Opens System Settings at the File System Extensions list (ExtensionSetupGuidance.location).
+    var openExtensionSettings: () throws -> Void = {}
     var openURL: (_ appPath: String, _ url: URL) throws -> Void
     var mountedVolumes: () -> [MountedVolume]
     var sleep: (_ seconds: TimeInterval) -> Void
+    /// The current time, for waits measured in elapsed seconds. Tests advance it with `sleep`.
+    var now: () -> Date = { Date() }
 
     /// Opens ParaAir's own sign-in (Storage Settings → ParaAir Cloud). The code is typed in the browser, never here.
     static let signInURL = URL(string: "paraair://cloud/sign-in")!
@@ -83,6 +89,25 @@ struct CLISystem {
         appStateFolders: { bundleID in
             guard let defaults = UserDefaults(suiteName: bundleID) else { return [] }
             return [defaults.string(forKey: "selectedStateRoot")].compactMap { $0 } + (defaults.stringArray(forKey: "knownStateRoots") ?? [])
+        },
+        otherAppCopies: { appPath, bundleID in
+            guard let bundleID else { return [] }
+            let registered = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: bundleID).map(\.path)
+            return OtherAppCopies.sort(registered: registered, current: appPath, exists: { FileManager.default.fileExists(atPath: $0) }).present
+        },
+        openExtensionSettings: {
+            // macOS 27: FSKit's own call, then the File System Extensions link; macOS 26: Login Items & Extensions.
+            var link = ExtensionSetupGuidance.loginItemsURL
+            #if canImport(FSKit)
+            if #available(macOS 27.0, *) {
+                if FSClient.shared.openFileSystemExtensionsSettings() { return }
+                link = ExtensionSetupGuidance.settingsURL
+            }
+            #endif
+            let output = try SystemCommands.run(executable: "/usr/bin/open", arguments: [link])
+            guard output.exitCode == 0 else {
+                throw DriveError(EIO, "macOS couldn’t open System Settings (exit \(output.exitCode)). Open \(ExtensionSetupGuidance.location) yourself")
+            }
         },
         openURL: { appPath, url in
             let output = try SystemCommands.run(executable: "/usr/bin/open", arguments: ["-a", appPath, url.absoluteString])

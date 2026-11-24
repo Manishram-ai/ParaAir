@@ -142,6 +142,19 @@ final class MenuModel: ObservableObject {
     @Published private(set) var readyConnection: StorageConnection?
     @Published private(set) var extensionState: FinderExtensionState = .unchecked
     @Published private(set) var checkingExtension = false
+    /// The person came back from System Settings, or chose Check Again, and the extension is still off.
+    @Published private(set) var extensionStillOff = false
+    /// On before on this Mac (UserDefaults "extensionWasEnabled"), off now: macOS switched it off, typically on replacement.
+    @Published private(set) var extensionTurnedOff = false
+    /// The home window opened once in this process for a switch macOS turned off.
+    private var shownTurnedOff = false
+    /// Other copies of ParaAir that LaunchServices knows about and that still exist.
+    @Published private(set) var otherAppCopies: [String] = []
+    /// Set when ParaAir opens System Settings for the switch; cleared once the extension is on.
+    private var extensionSettingsOpenedAt: Date?
+    private var extensionWatch: Task<Void, Never>?
+    /// Stale LaunchServices records this process already removed (each is tried once).
+    private var forgottenCopies: Set<String> = []
     private lazy var finderSetup = FinderSetupCoordinator(
         bundleIdentifier: Self.extensionBundleID,
         expectedPath: Bundle.main.bundleURL.appendingPathComponent("Contents/Extensions/StreamDriveFS.appex")
@@ -862,8 +875,24 @@ final class MenuModel: ObservableObject {
     }
     func refreshExtensionStatus(trigger: String = "home-window") async {
         checkingExtension = true
+        refreshOtherCopies()
         extensionState = await finderSetup.refresh()
         checkingExtension = finderSetup.isRefreshing
+        if extensionState == .enabled {
+            extensionStillOff = false
+            extensionSettingsOpenedAt = nil
+            extensionWatch?.cancel(); extensionWatch = nil
+            extensionTurnedOff = false
+            UserDefaults.standard.set(true, forKey: "extensionWasEnabled")
+        } else if extensionState == .disabled, UserDefaults.standard.bool(forKey: "extensionWasEnabled") {
+            extensionTurnedOff = true
+            // Show the one-click step at once, once per launch: the drives that were connected wait for it.
+            if !shownTurnedOff {
+                shownTurnedOff = true
+                AppLog.setup.notice("extension was on before and is off now; showing the switch step")
+                windowRequest = "connections"
+            }
+        }
         AppLog.setup.notice("extension refresh trigger=\(trigger, privacy: .public) state=\(String(describing: self.extensionState), privacy: .public) matchingModules=\(self.matchingModuleCount)")
         resumePendingSetup(trigger: "extension-" + trigger)
         resumeLoginMounts()
@@ -887,9 +916,56 @@ final class MenuModel: ObservableObject {
         requestContinuation(profile, reason: "continue-setup")
         Task { await refreshExtensionStatus(trigger: "continue-setup") }
     }
+    /// Each time ParaAir comes to the front: checks the switch again while it is off (the person may have turned it
+    /// on in System Settings without coming through ParaAir), and resumes a waiting mount.
     func resumeAfterSettings() {
-        guard finderSetup.hasPendingContinuation else { return }
-        Task { await refreshExtensionStatus(trigger: "app-active") }
+        let fromSettings = extensionSettingsOpenedAt != nil && extensionState != .enabled
+        guard finderSetup.hasPendingContinuation || extensionState != .enabled else { return }
+        Task {
+            await refreshExtensionStatus(trigger: "app-active")
+            // Back from System Settings with the switch still off: say what usually causes it.
+            if fromSettings, extensionState == .disabled,
+               let opened = extensionSettingsOpenedAt, Date().timeIntervalSince(opened) > 3 { extensionStillOff = true }
+        }
+    }
+    /// After ParaAir opens System Settings, checks every 2 seconds for up to 5 minutes so setup moves on by itself the
+    /// moment the switch is on, whether or not the person comes back to ParaAir first.
+    private func watchExtensionUntilEnabled() {
+        extensionWatch?.cancel()
+        // A deadline in elapsed time, and a check that never waits on FSKit: a discovery that is slow or never answers
+        // can't stretch or stall the watch (refreshExtensionInBackground skips while one is still running).
+        let deadline = Date().addingTimeInterval(300)
+        extensionWatch = Task { [weak self] in
+            while Date() < deadline {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if self.extensionState == .enabled { return }
+                self.refreshExtensionInBackground(trigger: "settings-watch")
+            }
+        }
+    }
+    /// Other registered copies of ParaAir. A record whose copy is gone is removed (it can confuse FSKit); a copy that
+    /// still exists is listed, and the person decides what to keep.
+    private func refreshOtherCopies() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let registered = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: bundleID).map(\.path)
+        let copies = OtherAppCopies.sort(registered: registered, current: Bundle.main.bundleURL.path,
+                                         exists: { FileManager.default.fileExists(atPath: $0) })
+        for path in copies.missing where forgottenCopies.insert(path).inserted {
+            AppLog.setup.notice("forgetting a missing ParaAir copy path=\(path, privacy: .private(mask: .hash))")
+            let url = URL(fileURLWithPath: path)
+            Task.detached(priority: .utility) { AppInstaller.unregister(url) }
+        }
+        if otherAppCopies != copies.present { otherAppCopies = copies.present }
+    }
+    /// Check Again: the person says the switch is on. Still off means it didn't save (usually the ⓘ sheet's switch).
+    func checkExtensionAgain() async {
+        await refreshExtensionStatus(trigger: "check-again")
+        if extensionState == .disabled { extensionStillOff = true }
+    }
+    func showOtherCopies() {
+        guard !otherAppCopies.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(otherAppCopies.map { URL(fileURLWithPath: $0) })
     }
     private func setupTarget(_ profile: DriveProfile) -> String {
         stateRoot.standardizedFileURL.path + "\0" + profile.name
@@ -956,8 +1032,17 @@ final class MenuModel: ObservableObject {
         if let profile = profiles.first, !isMounted(profile) {
             requestContinuation(profile, reason: "extension-settings")
         }
-        if #available(macOS 27.0, *), FSClient.shared.openFileSystemExtensionsSettings() { return }
-        if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+        if extensionState != .enabled {
+            extensionSettingsOpenedAt = Date()
+            watchExtensionUntilEnabled()
+        }
+        // macOS 27: FSKit's own call, then the File System Extensions link; macOS 26: Login Items & Extensions.
+        var link = ExtensionSetupGuidance.loginItemsURL
+        if #available(macOS 27.0, *) {
+            if FSClient.shared.openFileSystemExtensionsSettings() { return }
+            link = ExtensionSetupGuidance.settingsURL
+        }
+        if let url = URL(string: link) {
             if !NSWorkspace.shared.open(url) {
                 mountMessage = "Couldn’t open System Settings. Open General → Login Items & Extensions → By Category → File System Extensions, "
                     + "switch on ParaAir, then return and choose Check again."

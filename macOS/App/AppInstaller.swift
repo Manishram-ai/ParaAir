@@ -150,11 +150,19 @@ enum AppInstaller {
         let cleared = clearQuarantine(copy)
         AppLog.install.notice("copied quarantineCleared=\(cleared)")
         if replacing {
-            try files.trashItem(at: destination, resultingItemURL: nil)
-            AppLog.install.notice("older copy moved to Trash")
+            // One atomic swap, as Sparkle does: the file system extension never disappears from disk, so macOS keeps it
+            // switched on. Trashing the older copy first left a moment without it, and macOS turned the extension off.
+            guard renamex_np(copy.path, destination.path, UInt32(RENAME_SWAP)) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            // The older copy is now in staging: forget it, then keep it in the Trash as before.
+            unregister(copy)
+            do { try files.trashItem(at: copy, resultingItemURL: nil); AppLog.install.notice("older copy moved to Trash") }
+            catch { AppLog.install.error("older copy not moved to Trash; staging removes it") }
+        } else {
+            try files.moveItem(at: copy, to: destination)
         }
-        try files.moveItem(at: copy, to: destination)
-        AppLog.install.notice("installed at destination=\(destination.path, privacy: .private(mask: .hash))")
+        AppLog.install.notice("installed at destination=\(destination.path, privacy: .private(mask: .hash)) swapped=\(replacing)")
     }
 
     /// The person approved this download when they first opened it; the copy keeps
@@ -197,7 +205,8 @@ enum AppInstaller {
 
     /// Removes LaunchServices' and PlugInKit's records of a copy that is not the installed app.
     /// Bounded and best effort: a failure only leaves the record macOS would have kept anyway.
-    private static func unregister(_ copy: URL) {
+    /// Also used for records whose copy no longer exists (MenuModel.refreshOtherCopies).
+    nonisolated static func unregister(_ copy: URL) {
         let tools: [(String, [String])] = [
             ("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister", ["-u", copy.path]),
             ("/usr/bin/pluginkit", ["-r", copy.appendingPathComponent("Contents/Extensions/StreamDriveFS.appex").path]),
