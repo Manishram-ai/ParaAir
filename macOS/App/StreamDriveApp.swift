@@ -116,19 +116,27 @@ final class MenuModel: ObservableObject {
     }
     /// Folders besides the selected one whose drive mounts at login (spec D5).
     private var loginMounts = LoginMountFolders()
-    /// Kept folders whose login mount hasn't started yet; queued once per launch.
-    private var pendingLoginMounts: [URL] = []
+    /// Kept folders whose login mount hasn't started yet; queued once per launch. Published, like the renewals below,
+    /// because the home window's drive list reads them.
+    @Published private var pendingLoginMounts: [URL] = []
     private var loginMountsQueued = false
     /// The last results of every other known folder, renewed in its own task.
-    private var otherRenewals: [String: FolderRenewal] = [:]
+    @Published private var otherRenewals: [String: FolderRenewal] = [:]
     private var otherRenewalTask: Task<Void, Never>?
     /// Drives of other folders that didn't connect at login, by folder path.
     @Published private var otherDriveIssues: [String: String] = [:]
     /// A cloud drive's folder that became ready during a mount or drive creation.
     private var pendingAdoption: URL?
     @Published private(set) var adoptionNotice: String?
-    @Published var mounting = false
-    @Published var mountMessage: String?
+    @Published var mounting = false { didSet { if !mounting { mountingFolder = nil } } }
+    /// The state folder whose drive is mounting.
+    @Published private(set) var mountingFolder: String?
+    /// The first drive of each known folder besides the selected one, read in `reload()`.
+    private(set) var otherFolderDrives: [(root: URL, profile: DriveProfile)] = []
+    @Published var mountMessage: String? { didSet { if mountMessage == nil { mountMessageFolder = nil } } }
+    /// The state folder of the drive `mountMessage` is about, recorded when it is written (`showMountMessage`); nil
+    /// when it is about no single drive.
+    @Published private(set) var mountMessageFolder: String?
     @Published var sidebarMessage: String?
     /// Presentation requests shared by the home window, menu bar panel and Storage Settings.
     @Published var appearanceOpen = false
@@ -253,10 +261,7 @@ final class MenuModel: ObservableObject {
             if root == stateRoot {
                 continueSetup(profile)
             } else if (try? ProfileStore(root: root).list())?.first == profile {
-                // Another folder's drive mounts like a kept folder's at login, once that folder has been renewed.
-                if !pendingLoginMounts.contains(root) { pendingLoginMounts.append(root) }
-                if otherRenewals[root.path] == nil { renewNow(root) }
-                resumeLoginMounts()
+                connectOther(profile, root: root)
             }
         default:
             AppLog.setup.notice("external request ignored")
@@ -535,6 +540,40 @@ final class MenuModel: ObservableObject {
     /// The first drive of another folder that didn't connect at login.
     var otherDriveNotice: String? { otherDriveIssues.sorted { $0.key < $1.key }.first?.value }
 
+    /// Mounts another folder's drive the way a kept folder's drive mounts at login: once that folder has been renewed
+    /// and every gate is open. A mount request from another app and a drive row's Connect button both come here.
+    func connectOther(_ profile: DriveProfile, root: URL) {
+        if isMounted(profile) { reveal(profile); return }
+        setOtherDriveIssue(nil, root: root)
+        if !pendingLoginMounts.contains(where: { $0.path == root.path }) { pendingLoginMounts.append(root) }
+        if otherRenewals[root.path] == nil { renewNow(root) }
+        resumeLoginMounts()
+        refreshExtensionInBackground(trigger: "connect-other")
+    }
+
+    func otherFolderDrive(_ folder: String) -> (root: URL, profile: DriveProfile)? {
+        otherFolderDrives.first { $0.root.path == folder }
+    }
+
+    /// The drives of the other known folders, for the home window's list: mounted ones read from the mount table,
+    /// the rest from that folder's last renewal and its login mount.
+    func otherKnownDrives() -> [KnownDrive] {
+        otherFolderDrives.map { root, profile in
+            let issue = otherRenewals[root.path].flatMap { storageIssue(profile, root: root, renewal: $0) }
+            let mounted = isMounted(profile)
+            let state: KnownDrive.State
+            if mounted { state = issue == nil ? .connected : .needsSignIn }
+            else if mountingFolder == root.path { state = .connecting }
+            else if issue != nil { state = .needsSignIn }
+            // Queued for login or by its Connect button, waiting for its renewal or the switch.
+            else if pendingLoginMounts.contains(where: { $0.path == root.path }) { state = .connecting }
+            else { state = .off }
+            let failed = state == .off && otherDriveIssues[root.path] != nil
+            return KnownDrive(id: root.path, name: profile.finderName, storage: connectionSummary(profile, root: root),
+                              state: state, mounted: mounted, issue: issue ?? (failed ? KnownDrive.didNotConnect : nil))
+        }
+    }
+
     /// Continues what waits for no mount or drive creation to be running: a folder switch,
     /// the selected drive's continuation and the login mounts of other folders.
     private func resumeWaitingWork(trigger: String) {
@@ -715,10 +754,12 @@ final class MenuModel: ObservableObject {
         // A waiting switch keeps the sign-in it is for on screen until it happens.
         if pendingAdoption == nil { cloudAccount.reload() }
         activity.watch(stateRoot: stateRoot, profile: profiles.first)
+        let others = knownStateRoots().filter { $0 != stateRoot }.map { root in (root, (try? ProfileStore(root: root).list()) ?? []) }
         // Every known folder's ParaAir Cloud drive, not only the selected one: a drive in a folder of its own (ParaOS) too.
-        changeFeed.watch(knownStateRoots().flatMap { root in
-            (root == stateRoot ? profiles : (try? ProfileStore(root: root).list()) ?? []).map { (root, $0) }
-        })
+        let watched: [(stateRoot: URL, profile: DriveProfile)] = profiles.map { (stateRoot, $0) }
+            + others.flatMap { root, list in list.map { (root, $0) } }
+        changeFeed.watch(watched)
+        otherFolderDrives = others.compactMap { root, list in list.first.map { (root: root, profile: $0) } }
         readyConnection = profiles.isEmpty
             ? (try? ConnectionStore(root: stateRoot).list())?.first { $0.state == .storageReady } : nil
         mounted = Set(ParaAirVolumes.mountedPaths())
@@ -734,8 +775,15 @@ final class MenuModel: ObservableObject {
     func reveal(_ profile: DriveProfile) {
         guard let mount = profile.mountPoint, isMounted(profile) else { return }
         if !NSWorkspace.shared.open(URL(fileURLWithPath: mount, isDirectory: true)) {
-            mountMessage = "Finder couldn’t open the mounted drive at " + mount + "."
+            let folder = profiles.contains(profile) ? stateRoot : otherFolderDrives.first { $0.profile == profile }?.root
+            showMountMessage("Finder couldn’t open the mounted drive at " + mount + ".", about: folder)
         }
+    }
+    /// Shows a mount or Finder message and records which drive's folder it is about, so a list of several drives names
+    /// that drive (not whichever one is mounting when the window draws).
+    private func showMountMessage(_ text: String, about folder: URL?) {
+        mountMessage = text
+        mountMessageFolder = folder?.path
     }
     func mount(_ profile: DriveProfile) { mount(profile, root: stateRoot, readiness: readiness(profile)) }
 
@@ -761,10 +809,11 @@ final class MenuModel: ObservableObject {
         let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ParaAirCLI.app/Contents/MacOS/paraair")
         guard FileManager.default.isExecutableFile(atPath: helper.path) else {
             AppLog.mount.error("mount route=helper missing")
-            mountMessage = "This build is missing its mount helper."; return
+            showMountMessage("This build is missing its mount helper.", about: nil); return
         }
         AppLog.mount.notice("mount route=helper selected=\(selected)")
         mounting = true
+        mountingFolder = root.path
         if selected { mountMessage = nil }
         Task {
             defer { mounting = false; resumeWaitingWork(trigger: "mount-finished") }
@@ -776,16 +825,18 @@ final class MenuModel: ObservableObject {
                     // The helper exits 0 only once the volume is in the mount table.
                     AppLog.mount.notice("helper finished status=\(status) selected=false")
                     if status != 0 { setOtherDriveIssue(Self.otherDriveNotice(profile, root: root), root: root) }
+                    // The mount table and that folder's profile changed: read them before the list redraws.
+                    reload()
                     return
                 }
                 reload()
                 AppLog.mount.notice("helper finished status=\(status) mounted=\(self.isMounted(profile))")
                 if status != 0 || !isMounted(profile) {
-                    mountMessage = "ParaAir couldn’t open the drive. Check that ParaAir is turned on in System Settings, or review the connection in Storage Settings. Your saved files are retained."
+                    showMountMessage("ParaAir couldn’t open the drive. Check that ParaAir is turned on in System Settings, or review the connection in Storage Settings. Your saved files are retained.", about: root)
                 }
             } catch {
                 AppLog.mount.error("helper failed errno=\((error as? DriveError)?.code ?? -1)")
-                if root == stateRoot { mountMessage = error.localizedDescription }
+                if root == stateRoot { showMountMessage(error.localizedDescription, about: root) }
                 else { setOtherDriveIssue(Self.otherDriveNotice(profile, root: root), root: root) }
             }
         }
@@ -793,12 +844,13 @@ final class MenuModel: ObservableObject {
     @available(macOS 27.0, *)
     private func mountNative(_ profile: DriveProfile, root: URL) {
         mounting = true
+        mountingFolder = root.path
         if root == stateRoot { mountMessage = nil }
         let operation = NativeMountOperation { [weak self] event in
             guard let self else { return }
             switch event {
             case .pending:
-                self.mountMessage = Self.mountPendingNotice
+                self.showMountMessage(Self.mountPendingNotice, about: root)
             case .finished(let result):
                 defer { self.mounting = false; self.nativeMount = nil; self.resumeWaitingWork(trigger: "mount-finished") }
                 if root != self.stateRoot, self.mountMessage == Self.mountPendingNotice { self.mountMessage = nil }
@@ -820,14 +872,15 @@ final class MenuModel: ObservableObject {
                     // pins and durable pending writes.
                     saved.mountPoint = url.path
                     try store.save(saved, overwrite: true)
-                    guard root == self.stateRoot else { return }
+                    // Another folder's drive: read the new mount point and the mount table before the list redraws.
+                    guard root == self.stateRoot else { self.reload(); return }
                     self.reload()
                     guard self.isMounted(saved) else {
                         throw DriveError(EIO, "macOS returned a volume that is not present in the mount table")
                     }
                     self.mountMessage = nil
                 } catch {
-                    if root == self.stateRoot { self.mountMessage = error.localizedDescription }
+                    if root == self.stateRoot { self.showMountMessage(error.localizedDescription, about: root) }
                     else { self.setOtherDriveIssue(Self.otherDriveNotice(profile, root: root), root: root) }
                 }
             }
@@ -836,7 +889,7 @@ final class MenuModel: ObservableObject {
         do { try operation.start(stateRoot: root, profileName: profile.name) }
         catch {
             nativeMount = nil; mounting = false
-            if root == stateRoot { mountMessage = error.localizedDescription }
+            if root == stateRoot { showMountMessage(error.localizedDescription, about: root) }
             else { setOtherDriveIssue(Self.otherDriveNotice(profile, root: root), root: root) }
             // After this call returns, so a queued mount doesn't start inside the one that failed.
             Task { resumeWaitingWork(trigger: "mount-failed") }
@@ -1015,12 +1068,13 @@ final class MenuModel: ObservableObject {
         }
     }
     func canMount(_ profile: DriveProfile) -> Bool { readiness(profile).canStartMount }
-    func connectionSummary(_ profile: DriveProfile) -> String {
+    func connectionSummary(_ profile: DriveProfile) -> String { connectionSummary(profile, root: stateRoot) }
+    func connectionSummary(_ profile: DriveProfile, root: URL) -> String {
         if profile.backend == .paraairCloud {
-            let account = profile.cloudAccountID.flatMap { try? CloudAccountStore(root: stateRoot).load($0) }
+            let account = profile.cloudAccountID.flatMap { try? CloudAccountStore(root: root).load($0) }
             return account.map { "ParaAir Cloud · " + $0.email } ?? "ParaAir Cloud"
         }
-        guard let id = profile.connectionID, let record = try? ConnectionStore(root: stateRoot).load(id) else {
+        guard let id = profile.connectionID, let record = try? ConnectionStore(root: root).load(id) else {
             return "Your saved storage connection"
         }
         // A connection keeps its provider title as its default name; show the bucket instead
@@ -1044,8 +1098,8 @@ final class MenuModel: ObservableObject {
         }
         if let url = URL(string: link) {
             if !NSWorkspace.shared.open(url) {
-                mountMessage = "Couldn’t open System Settings. Open General → Login Items & Extensions → By Category → File System Extensions, "
-                    + "switch on ParaAir, then return and choose Check again."
+                showMountMessage("Couldn’t open System Settings. Open General → Login Items & Extensions → By Category → File System Extensions, "
+                    + "switch on ParaAir, then return and choose Check again.", about: nil)
             }
         }
     }
@@ -1092,14 +1146,33 @@ final class MenuModel: ObservableObject {
             pendingAdoption = nil; adoptionNotice = nil
             loginMounts.choose(selected.standardizedFileURL.path, leaving: stateRoot.path, previousHasDrive: Self.hasDrive(stateRoot))
             saveLoginMounts()
-            stateRoot = selected.standardizedFileURL
-            setOtherDriveIssue(nil, root: stateRoot)
-            UserDefaults.standard.set(stateRoot.path, forKey: "selectedStateRoot")
-            mountMessage = nil; sidebarMessage = nil
-            rememberStateRoot(stateRoot)
-            replaceCloudAccount()
-            startRenewal(); reload()
-            logLifecycle("select-folder")
+            select(selected.standardizedFileURL, event: "select-folder")
         }
+    }
+
+    /// Makes a known folder the selected one, for a drive row's Sign In Again…: Storage Settings shows the selected
+    /// folder's connections. Like a ParaAir Cloud drive becoming ready, the folder it leaves keeps mounting at login
+    /// while it has a drive, and a mounted drive stays mounted. Returns false while a mount or drive creation runs.
+    func selectKnownFolder(_ url: URL) -> Bool {
+        let root = url.standardizedFileURL
+        guard root != stateRoot else { return true }
+        guard !creatingDrive, !mounting else { return false }
+        finderSetup.cancelContinuation()
+        pendingAdoption = nil; adoptionNotice = nil
+        loginMounts.adopt(root.path, leaving: stateRoot.path, previousHasDrive: Self.hasDrive(stateRoot))
+        saveLoginMounts()
+        select(root, event: "select-known-folder")
+        return true
+    }
+
+    private func select(_ root: URL, event: String) {
+        stateRoot = root
+        setOtherDriveIssue(nil, root: stateRoot)
+        UserDefaults.standard.set(stateRoot.path, forKey: "selectedStateRoot")
+        mountMessage = nil; sidebarMessage = nil
+        rememberStateRoot(stateRoot)
+        replaceCloudAccount()
+        startRenewal(); reload()
+        logLifecycle(event)
     }
 }
