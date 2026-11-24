@@ -94,7 +94,7 @@ enum CLIHelp {
             for a service credential. cat-version writes the version's bytes to standard output, unchanged (exit 0
             only when all of them were written). restore-version makes a version current again, as a new version;
             with --expected-version it refuses (exit 16) when the file's current version is another one.
-            A MOUNTED_PATH such as /Volumes/ParaOS/records/x.json names the drive and the file in one argument.
+            A MOUNTED_PATH such as /Volumes/Team/projects/plan.md names the drive and the file in one argument.
             """ + "\n"
         case "conflict-info":
             return """
@@ -113,9 +113,11 @@ enum CLIHelp {
             when following, then {cursor, change, kind, path, fromPath?, rescan?, version, at, author} per change,
             and {"reset": true, "cursor": N} when changes after your cursor were pruned (rescan, then go on).
             change is create, write, delete, move, restore, mkdir or purge; rescan asks to list that folder again.
-            Only changes at or under FOLDER (or the mounted path's folder) are printed. This Mac's caches drop each
-            path before its line is printed, so reading it through the mount right after gets the new contents.
-            Offline or busy service: --follow waits and goes on.
+            Only changes at or under FOLDER (or the mounted path's folder) are printed. ParaAir's own caches drop each
+            path before its line is printed; macOS may still show a mounted file's old contents for a while (on
+            macOS 26 until the drive is mounted again).
+            Offline or busy service: once following, --follow waits and goes on; without --since, failing to get the
+            first cursor ends it.
             """ + "\n"
         case "access":
             return """
@@ -209,8 +211,8 @@ enum CLIHelp {
               doctor [PROFILE]                    Check local prerequisites without network or Keychain access
               help [COMMAND]
 
-            TARGET is PROFILE PATH (a path in the drive, such as /records/x.json) or a path under a mounted drive,
-            such as /Volumes/ParaOS/records/x.json; the drive and its state folder are worked out from the mount.
+            TARGET is PROFILE PATH (a path in the drive, such as /projects/plan.md) or a path under a mounted drive,
+            such as /Volumes/Team/projects/plan.md; the drive and its state folder are worked out from the mount.
             --json returns structured results. --profile NAME can replace a positional profile.
             State: --state-dir, then STREAMDRIVE_HOME, then ~/Library/Application Support/StreamDrive.
             The streamdrive command remains available for compatibility.

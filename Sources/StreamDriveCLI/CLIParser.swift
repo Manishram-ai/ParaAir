@@ -51,8 +51,8 @@ enum CLICommand: Equatable {
     case credentials(CLICredentialAction, account: String, workspace: String)
 }
 
-/// A path in a drive: a profile and a drive path (`PROFILE /records/x.json`), or a path under a mounted ParaAir drive
-/// (`/Volumes/ParaOS/records/x.json`), from which the profile and its state folder are worked out.
+/// A path in a drive: a profile and a drive path (`PROFILE /projects/plan.md`), or a path under a mounted ParaAir drive
+/// (`/Volumes/Team/projects/plan.md`), from which the profile and its state folder are worked out.
 enum CLITarget: Equatable {
     case drive(profile: String, path: String)
     case mounted(String)
