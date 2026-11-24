@@ -29,16 +29,33 @@ private final class CLICloudStub: URLProtocol {
     /// Well formed, but for another credential than the reply names: a malformed reply.
     static let otherToken = "pcs_cred_01JDKQ2T5V7WXYZ0123456789B.Zz9yX8wV7uT6sR5qP4oN3mL2kJ1iH0gF_-eDcBaQwEr"
     private static let lock = NSLock()
-    private static var logged: [(path: String, body: Data)] = []
+    private static var logged: [(path: String, body: Data, method: String)] = []
     /// What GET /v1/drives lists (names only; the drive above is the one whose details exist).
     private static var listed: [(id: String, name: String)] = [(drive, "ParaAir Cloud")]
-    static var requests: [(path: String, body: Data)] { lock.lock(); defer { lock.unlock() }; return logged }
+    static var requests: [(path: String, body: Data, method: String)] { lock.lock(); defer { lock.unlock() }; return logged }
+    /// The workspace's members (GET/POST /v1/workspaces/{ws}/members, PATCH/DELETE .../{userId}); 3 seats.
+    static let ownerID = "usr_0123456789ABCDEFGHJKMNPQRS", adminID = "usr_1123456789ABCDEFGHJKMNPQRS"
+    /// A workspace whose members the account may not manage (403), and one it isn't in (404).
+    static let forbiddenWorkspace = "ws_ZZZZZZZZZZZZZZZZZZZZZZZZZZ", otherWorkspace = "ws_YYYYYYYYYYYYYYYYYYYYYYYYYY"
+    private static let initialMembers: [[String: String]] = [
+        ["userId": ownerID, "email": "cli@example.test", "role": "owner", "addedAt": "2026-11-23T10:00:00.000Z", "status": "active"],
+        ["userId": adminID, "email": "ann@example.test", "role": "admin", "addedAt": "2026-11-23T10:00:00.000Z", "status": "invited"],
+    ]
+    private static var memberRows = initialMembers
+    /// How the next member change (POST, PATCH or DELETE) goes wrong: applied and then answered 500, or refused because the
+    /// account is no longer in the workspace.
+    enum MemberFault { case appliedThen500, workspaceGone }
+    private static var memberFault: MemberFault?
+    static func failNextMemberChange(_ fault: MemberFault) { lock.lock(); memberFault = fault; lock.unlock() }
+    /// false: answer adds like a service that predates `notify` (no `notified` field, nothing emailed).
+    private static var notifySupported = true
+    static func serviceKnowsNotify(_ value: Bool) { lock.lock(); notifySupported = value; lock.unlock() }
     /// Not valid UTF-8, so cat-version must pass bytes through untouched.
     static let versionBytes = Data([0x7b, 0x22, 0x76, 0x22, 0x3a, 0x31, 0x7d, 0x0a, 0x00, 0xff, 0xfe])
     static var versionHash: String { SHA256.hash(data: versionBytes).map { String(format: "%02x", $0) }.joined() }
     /// Whether the "throttled" create was already answered 429 once.
     private static var throttled = false
-    static func reset() { lock.lock(); logged = []; listed = [(drive, "ParaAir Cloud")]; throttled = false; lock.unlock() }
+    static func reset() { lock.lock(); logged = []; listed = [(drive, "ParaAir Cloud")]; throttled = false; memberRows = initialMembers; memberFault = nil; notifySupported = true; lock.unlock() }
     static func list(_ drives: [(id: String, name: String)]) { lock.lock(); listed = drives; lock.unlock() }
 
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host == host }
@@ -51,12 +68,21 @@ private final class CLICloudStub: URLProtocol {
             while stream.hasBytesAvailable { let count = stream.read(&buffer, maxLength: buffer.count); if count <= 0 { break }; body.append(buffer, count: count) }
         }
         let path = request.url!.path
-        Self.lock.lock(); Self.logged.append((path + (request.url!.query(percentEncoded: true).map { "?" + $0 } ?? ""), body)); Self.lock.unlock()
+        Self.lock.lock(); Self.logged.append((path + (request.url!.query(percentEncoded: true).map { "?" + $0 } ?? ""), body, request.httpMethod ?? "GET")); Self.lock.unlock()
         if path.hasPrefix("/v1/w/") {
             // The one chunk of version pv:9001 (cat-version).
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
                                                                   headerFields: ["Content-Type": "application/octet-stream"])!, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: Self.versionBytes)
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        if path.hasPrefix("/v1/workspaces/"), path.contains("/members") {
+            let (status, object) = Self.members(path: path, method: request.httpMethod ?? "GET", body: body)
+            let data = try! JSONSerialization.data(withJSONObject: object)
+            client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
+                                                                  headerFields: ["Content-Type": "application/json"])!, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)
             return
         }
@@ -175,6 +201,57 @@ private final class CLICloudStub: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+
+    /// The members routes, with the service's seat (3) and last-owner rules, and the fault set for the next change.
+    private static func members(path: String, method: String, body: Data) -> (Int, Any) {
+        lock.lock(); let fault = method == "GET" ? nil : memberFault; if method != "GET" { memberFault = nil }; lock.unlock()
+        let failure = { (status: Int, code: String) -> (Int, Any) in (status, ["error": ["code": code, "message": "x", "requestId": "req_TEST"]]) }
+        if fault == .workspaceGone { return failure(404, "workspace_not_found") }
+        let result = applyMembers(path: path, method: method, body: body)
+        return fault == .appliedThen500 && (200..<300).contains(result.0) ? failure(500, "internal") : result
+    }
+
+    private static func applyMembers(path: String, method: String, body: Data) -> (Int, Any) {
+        func error(_ status: Int, _ code: String) -> (Int, Any) { (status, ["error": ["code": code, "message": "x", "requestId": "req_TEST"]]) }
+        let base = "/v1/workspaces/\(workspace)/members"
+        if path.hasPrefix("/v1/workspaces/\(forbiddenWorkspace)/") { return error(403, "forbidden") }
+        guard path == base || path.hasPrefix(base + "/") else { return error(404, "workspace_not_found") }
+        lock.lock(); defer { lock.unlock() }
+        let object = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
+        let fields = object.compactMapValues { $0 as? String }
+        let owners = memberRows.filter { $0["role"] == "owner" }.count
+        if path == base, method == "GET" {
+            return (200, ["workspace": ["id": workspace, "name": "Studio", "kind": "team", "plan": "team", "seats": 3, "seatsUsed": memberRows.count] as [String: Any],
+                          "members": memberRows])
+        }
+        if path == base, method == "POST" {
+            let email = (fields["email"] ?? "").trimmingCharacters(in: .whitespaces).lowercased(), role = fields["role"] ?? "member"
+            // An invitation goes out only to a newly added address, and only when asked.
+            func answer(_ row: [String: String], emailed: Bool) -> [String: Any] { notifySupported ? ["member": row, "notified": emailed] : ["member": row] }
+            if let existing = memberRows.first(where: { $0["email"] == email }) {
+                return existing["role"] == role ? (200, answer(existing, emailed: false)) : error(409, "already_exists")
+            }
+            guard memberRows.count < 3 else { return error(409, "busy") }
+            let row = ["userId": String(format: "usr_%026d", memberRows.count + 7), "email": email, "role": role,
+                       "addedAt": "2026-11-24T10:00:00.000Z", "status": "invited"]
+            memberRows.append(row)
+            return (201, answer(row, emailed: object["notify"] as? Bool == true))
+        }
+        let userID = String(path.dropFirst(base.count + 1))
+        guard let index = memberRows.firstIndex(where: { $0["userId"] == userID }) else { return error(404, "not_found") }
+        let lastOwner = memberRows[index]["role"] == "owner" && owners == 1
+        switch method {
+        case "PATCH":
+            guard !(lastOwner && fields["role"] != "owner") else { return error(409, "busy") }
+            memberRows[index]["role"] = fields["role"]
+            return (200, ["member": memberRows[index]])
+        case "DELETE":
+            guard !lastOwner else { return error(409, "busy") }
+            memberRows.remove(at: index)
+            return (204, [String: Any]())
+        default: return error(405, "invalid_request")
+        }
+    }
 }
 
 final class CLIApplicationTests: XCTestCase {
@@ -907,6 +984,183 @@ extension CLIApplicationTests {
 }
 
 extension CLIApplicationTests {
+    func testMembersListAddRoleAndRemove() throws {
+        let fixture = try cloudFixture()
+        let app = CLIApplication(environment: ["STREAMDRIVE_HOME": fixture.root.path], dependencies: fixture.dependencies, system: FakeSystem().system)
+        let base = ["--cloud-account", fixture.account.id, "--workspace", CLICloudStub.workspace]
+        let route = "/v1/workspaces/\(CLICloudStub.workspace)/members"
+        func last() -> (path: String, method: String, body: NSDictionary?) {
+            let request = CLICloudStub.requests.last!
+            return (request.path, request.method, try? JSONSerialization.jsonObject(with: request.body) as? NSDictionary)
+        }
+
+        let listed = app.run(["members", "list"] + base + ["--json"])
+        XCTAssertEqual(listed.exitCode, 0, listed.stdout + listed.stderr)
+        XCTAssertEqual((try object(listed)["workspace"] as? [String: Any])?["seats"] as? Int, 3)
+        XCTAssertEqual((try object(listed)["members"] as? [[String: Any]])?.map { $0["email"] as? String }, ["cli@example.test", "ann@example.test"])
+        XCTAssertEqual(app.run(["members", "list"] + base).stdout, """
+            Studio: 2 of 3 seats used
+            \(CLICloudStub.ownerID)\towner\tactive\tcli@example.test
+            \(CLICloudStub.adminID)\tadmin\tinvited\tann@example.test
+
+            """)
+
+        // add: a new address is a member at once, with role member unless --role; a retry answers "already".
+        // Without --notify nothing asks for an email, and the output says so.
+        let added = app.run(["members", "add"] + base + ["--email", "New@Example.test", "--json"])
+        XCTAssertEqual(added.exitCode, 0, added.stdout + added.stderr)
+        XCTAssertEqual(try object(added)["added"] as? Bool, true)
+        XCTAssertEqual(try object(added)["notified"] as? Bool, false)
+        XCTAssertEqual((try object(added)["member"] as? [String: Any])?["status"] as? String, "invited")
+        XCTAssertEqual(last().path, route); XCTAssertEqual(last().method, "POST")
+        XCTAssertEqual(last().body, ["email": "New@Example.test", "role": "member"])
+        XCTAssertEqual(app.run(["members", "add"] + base + ["--email", "new@example.test"]).stdout, "new@example.test is already a member (member).\n")
+        let otherRole = app.run(["members", "add"] + base + ["--email", "new@example.test", "--role", "viewer"])
+        XCTAssertEqual(otherRole.exitCode, 1); XCTAssertTrue(otherRole.stderr.contains("already a member with another role"), otherRole.stderr)
+        let full = app.run(["members", "add"] + base + ["--email", "fourth@example.test", "--role", "admin"])
+        XCTAssertEqual(full.exitCode, 1); XCTAssertTrue(full.stderr.contains("no free seat"), full.stderr)
+
+        // role and remove find the member by email, then call by user id.
+        let changed = app.run(["members", "role"] + base + ["--email", "ANN@example.test", "--role", "viewer", "--json"])
+        XCTAssertEqual(changed.exitCode, 0, changed.stdout + changed.stderr)
+        XCTAssertEqual((try object(changed)["member"] as? [String: Any])?["role"] as? String, "viewer")
+        XCTAssertEqual(last().path, "\(route)/\(CLICloudStub.adminID)"); XCTAssertEqual(last().method, "PATCH"); XCTAssertEqual(last().body, ["role": "viewer"])
+        let lastOwner = app.run(["members", "role"] + base + ["--email", "cli@example.test", "--role", "admin"])
+        XCTAssertEqual(lastOwner.exitCode, 1); XCTAssertTrue(lastOwner.stderr.contains("needs an owner"), lastOwner.stderr)
+        XCTAssertEqual(app.run(["members", "remove"] + base + ["--email", "cli@example.test"]).exitCode, 1)
+
+        let removed = app.run(["members", "remove"] + base + ["--email", "new@example.test", "--json"])
+        XCTAssertEqual(removed.exitCode, 0, removed.stdout + removed.stderr)
+        XCTAssertEqual(try object(removed)["removed"] as? Bool, true)
+        XCTAssertEqual(last().method, "DELETE"); XCTAssertTrue(last().path.hasPrefix(route + "/usr_"), last().path)
+        let sent = CLICloudStub.requests.count
+        let gone = app.run(["members", "remove"] + base + ["--email", "new@example.test", "--json"])
+        XCTAssertEqual(gone.exitCode, 17); XCTAssertEqual(try object(gone)["code"] as? String, "not_found")
+        XCTAssertEqual(CLICloudStub.requests.count, sent + 1, "only the list; nothing to delete")
+
+        // --notify (anywhere after the verb) sends notify: true; the service emails a newly added address.
+        let invited = app.run(["members", "add", "--notify"] + base + ["--email", "kim@example.test", "--role", "viewer", "--json"])
+        XCTAssertEqual(invited.exitCode, 0, invited.stdout + invited.stderr)
+        XCTAssertEqual(last().body, ["email": "kim@example.test", "role": "viewer", "notify": true])
+        XCTAssertEqual(try object(invited)["added"] as? Bool, true); XCTAssertEqual(try object(invited)["notified"] as? Bool, true)
+        XCTAssertEqual(Set(try object(invited).keys), ["member", "added", "notified"])
+        XCTAssertEqual(app.run(["members", "remove"] + base + ["--email", "kim@example.test"]).exitCode, 0)
+        XCTAssertEqual(app.run(["members", "add"] + base + ["--email", "kim@example.test", "--notify"]).stdout,
+                       "Added kim@example.test as member. ParaAir emailed them how to start.\n")
+        XCTAssertEqual(last().body, ["email": "kim@example.test", "role": "member", "notify": true])
+        // A retry with --notify emails nobody: the address already was a member.
+        let again = app.run(["members", "add"] + base + ["--email", "kim@example.test", "--notify", "--json"])
+        XCTAssertEqual(try object(again)["added"] as? Bool, false); XCTAssertEqual(try object(again)["notified"] as? Bool, false)
+        XCTAssertEqual(app.run(["members", "remove"] + base + ["--email", "kim@example.test"]).exitCode, 0)
+        // A service that predates notify ignores it and omits notified: read as false, and the text says to tell them.
+        CLICloudStub.serviceKnowsNotify(false)
+        let older = app.run(["members", "add"] + base + ["--email", "lee@example.test", "--notify", "--json"])
+        XCTAssertEqual(older.exitCode, 0, older.stdout + older.stderr)
+        XCTAssertEqual(try object(older)["added"] as? Bool, true); XCTAssertEqual(try object(older)["notified"] as? Bool, false)
+        XCTAssertEqual(app.run(["members", "remove"] + base + ["--email", "lee@example.test"]).exitCode, 0)
+        XCTAssertEqual(app.run(["members", "add"] + base + ["--email", "lee@example.test", "--notify"]).stdout,
+                       "Added lee@example.test as member. Nothing was emailed: tell them to sign in to ParaAir with this address.\n")
+        XCTAssertEqual(app.run(["members", "remove"] + base + ["--email", "lee@example.test"]).exitCode, 0)
+        CLICloudStub.serviceKnowsNotify(true)
+
+        // Not an owner or admin there: 12; a workspace the account isn't in: 14; an account not signed in here: 11.
+        let forbidden = app.run(["members", "list", "--cloud-account", fixture.account.id, "--workspace", CLICloudStub.forbiddenWorkspace, "--json"])
+        XCTAssertEqual(forbidden.exitCode, 12); XCTAssertEqual(try object(forbidden)["code"] as? String, "forbidden")
+        XCTAssertEqual(app.run(["members", "list", "--cloud-account", fixture.account.id, "--workspace", CLICloudStub.otherWorkspace]).exitCode, 14)
+        XCTAssertEqual(app.run(["members", "list", "--cloud-account", "6b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e", "--workspace", CLICloudStub.workspace]).exitCode, 11)
+
+        for usage in [["members"], ["members", "invite"] + base, ["members", "list", "--cloud-account", fixture.account.id],
+                      ["members", "list", "--workspace", CLICloudStub.workspace], ["members", "list"] + base + ["--email", "a@example.test"],
+                      ["members", "add"] + base, ["members", "add"] + base + ["--email", "no-at-sign"],
+                      ["members", "add"] + base + ["--email", "a@example.test", "--role", "boss"],
+                      ["members", "role"] + base + ["--email", "a@example.test"], ["members", "remove"] + base + ["--email", "a@example.test", "--role", "viewer"],
+                      ["members", "list", "--cloud-account", fixture.account.id, "--workspace", "ws_lower"], ["members", "list"] + base + ["extra"],
+                      ["members", "list"] + base + ["--notify"], ["members", "role"] + base + ["--email", "a@example.test", "--role", "viewer", "--notify"],
+                      ["members", "remove"] + base + ["--email", "a@example.test", "--notify"],
+                      ["members", "add"] + base + ["--email", "a@example.test", "--notify", "--notify"],
+                      ["members", "add"] + base + ["--email", "a@example.test", "--notify=yes"]] {
+            XCTAssertEqual(app.run(usage).exitCode, 2, usage.joined(separator: " "))
+        }
+        let help = app.run(["help", "members"]).stdout
+        XCTAssertTrue(help.contains("paraair members add") && help.contains("--notify"), help)
+    }
+
+    /// An add or removal may go through even when its answer is lost (a 5xx, a dropped connection). Retrying would read
+    /// back "already a member" or "not a member", so each is sent once and the error says to check the list. A workspace
+    /// the account left between the lookup and the change keeps exit 14.
+    func testMemberChangesThatMayHaveHappenedAreSentOnceAndKeepTheirExitCodes() throws {
+        let fixture = try cloudFixture()
+        let app = CLIApplication(environment: ["STREAMDRIVE_HOME": fixture.root.path], dependencies: fixture.dependencies, system: FakeSystem().system)
+        let base = ["--cloud-account", fixture.account.id, "--workspace", CLICloudStub.workspace]
+        let route = "/v1/workspaces/\(CLICloudStub.workspace)/members"
+        func sent(_ method: String) -> Int { CLICloudStub.requests.filter { $0.method == method && $0.path.hasPrefix(route) }.count }
+
+        CLICloudStub.failNextMemberChange(.appliedThen500)
+        let add = app.run(["members", "add"] + base + ["--email", "kim@example.test", "--notify", "--json"])
+        XCTAssertEqual(add.exitCode, 1, add.stdout); XCTAssertEqual(sent("POST"), 1)
+        XCTAssertTrue((try object(add)["error"] as? String ?? "").hasSuffix("The address may have been added: check members list"), add.stdout)
+        XCTAssertTrue(app.run(["members", "list"] + base).stdout.contains("kim@example.test"), "it was added")
+
+        CLICloudStub.failNextMemberChange(.appliedThen500)
+        let remove = app.run(["members", "remove"] + base + ["--email", "kim@example.test", "--json"])
+        XCTAssertEqual(remove.exitCode, 1, remove.stdout); XCTAssertEqual(sent("DELETE"), 1)
+        XCTAssertTrue((try object(remove)["error"] as? String ?? "").hasSuffix("The member may have been removed: check members list"), remove.stdout)
+        XCTAssertFalse(app.run(["members", "list"] + base).stdout.contains("kim@example.test"), "it was removed")
+
+        for arguments in [["members", "role"] + base + ["--email", "ann@example.test", "--role", "viewer"],
+                          ["members", "remove"] + base + ["--email", "ann@example.test"]] {
+            CLICloudStub.failNextMemberChange(.workspaceGone)
+            let result = app.run(arguments + ["--json"])
+            XCTAssertEqual(result.exitCode, 14, arguments.joined(separator: " ") + "\n" + result.stdout)
+            XCTAssertEqual(try object(result)["code"] as? String, "drive_not_found")
+        }
+    }
+
+    /// The calls ParaOS's access reconcile (Parafield-OS #22) makes, each with --state-dir first: their JSON shapes and
+    /// exit codes are a contract with that app.
+    func testParaOSReconcileCallsKeepTheirShapes() throws {
+        let fixture = try cloudFixture(), fake = FakeSystem(), elsewhere = try temporaryDirectory()
+        addTeardownBlock { try? FileManager.default.removeItem(at: elsewhere); _ = fake }
+        try ProfileStore(root: fixture.root).save(DriveProfile(name: "ParaOS", backend: .paraairCloud, blockSize: 4_194_304, cloudIssuer: fixture.account.issuer,
+                                                               cloudAccountID: fixture.account.id, cloudDriveID: CLICloudStub.drive))
+        // The environment points at another folder: --state-dir alone finds the account and the profile.
+        let app = CLIApplication(environment: ["STREAMDRIVE_HOME": elsewhere.path, "PARAAIR_APP_PATH": "/missing/ParaAir.app"],
+                                 dependencies: fixture.dependencies, system: fake.system)
+        let members = ["--cloud-account", fixture.account.id, "--workspace", CLICloudStub.workspace]
+        func run(_ arguments: [String], exitCode: Int32 = 0) throws -> [String: Any] {
+            let result = app.run(["--state-dir", fixture.root.path] + arguments + ["--json"])
+            XCTAssertEqual(result.exitCode, exitCode, arguments.joined(separator: " ") + "\n" + result.stdout + result.stderr)
+            return try object(result)
+        }
+        let memberKeys: Set<String> = ["userId", "email", "role", "addedAt", "status"]
+
+        let list = try run(["members", "list"] + members)
+        XCTAssertEqual(Set(list.keys), ["workspace", "members"])
+        XCTAssertEqual((list["workspace"] as? [String: Any])?["id"] as? String, CLICloudStub.workspace)
+        for member in try XCTUnwrap(list["members"] as? [[String: Any]]) { XCTAssertEqual(Set(member.keys), memberKeys) }
+
+        let added = try run(["members", "add"] + members + ["--email", "kim@example.test", "--role", "viewer", "--notify"])
+        XCTAssertEqual(Set(added.keys), ["member", "added", "notified"])
+        XCTAssertEqual(Set(try XCTUnwrap(added["member"] as? [String: Any]).keys), memberKeys)
+        XCTAssertEqual(added["added"] as? Bool, true); XCTAssertEqual(added["notified"] as? Bool, true)
+
+        let changed = try run(["members", "role"] + members + ["--email", "kim@example.test", "--role", "member"])
+        XCTAssertEqual(Set(changed.keys), ["member"]); XCTAssertEqual((changed["member"] as? [String: Any])?["role"] as? String, "member")
+
+        XCTAssertEqual(Set(try run(["members", "remove"] + members + ["--email", "kim@example.test"]).keys), ["userId", "email", "removed"])
+        XCTAssertEqual(try run(["members", "remove"] + members + ["--email", "kim@example.test"], exitCode: 17)["code"] as? String, "not_found")
+
+        XCTAssertEqual(Set(try run(["access", "list", "ParaOS", "/"]).keys), ["path", "rules"])
+        XCTAssertEqual(Set(try run(["access", "set", "ParaOS", "/people/kim", "--email", "kim@example.test", "--level", "write"]).keys), ["rule"])
+        XCTAssertEqual(Set(try run(["access", "remove", "ParaOS", "/people/kim", "--email", "kim@example.test"]).keys), ["path", "principal", "removed"])
+
+        XCTAssertEqual(try run(["members", "list", "--cloud-account", fixture.account.id, "--workspace", CLICloudStub.forbiddenWorkspace],
+                               exitCode: 12)["code"] as? String, "forbidden")
+        XCTAssertEqual(try run(["members", "list"] + members + ["--role", "viewer"], exitCode: 2)["code"] as? String, "usage")
+        // A ParaAir without the command answers an unknown command the same way: exit 2, code usage.
+        XCTAssertEqual(try run(["no-such-command", "list"] + members, exitCode: 2)["code"] as? String, "usage")
+    }
+
     func testASecondDriveGetsAStateFolderOfItsOwnSharingTheSignIn() throws {
         let fixture = try cloudFixture(), fake = FakeSystem()
         let home = try temporaryDirectory()
