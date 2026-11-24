@@ -21,9 +21,11 @@ private final class ObservedBackend: StorageBackend, @unchecked Sendable {
         var committedPaths: [String] = []
         var statusCalls = 0
         var stats = 0
+        var lists = 0
         var capacity: VolumeCapacity?
         var onCommit: (() -> Void)?
         var onCommitOf: ((String) -> Void)?
+        var onList: ((String) -> Void)?
     }
     private let lock = NSLock()
     private var values = Values()
@@ -35,6 +37,7 @@ private final class ObservedBackend: StorageBackend, @unchecked Sendable {
     var committedPaths: [String] { with { $0.committedPaths } }
     var statusCalls: Int { with { $0.statusCalls } }
     var stats: Int { with { $0.stats } }
+    var lists: Int { with { $0.lists } }
     var offline: Bool { get { with { $0.offline } } set { with { $0.offline = newValue } } }
     var failAfterCommit: Bool { get { with { $0.failAfterCommit } } set { with { $0.failAfterCommit = newValue } } }
     /// The errno of the injected lost reply.
@@ -48,10 +51,17 @@ private final class ObservedBackend: StorageBackend, @unchecked Sendable {
     var capacityValue: VolumeCapacity? { get { with { $0.capacity } } set { with { $0.capacity = newValue } } }
     var onCommit: (() -> Void)? { get { with { $0.onCommit } } set { with { $0.onCommit = newValue } } }
     var onCommitOf: ((String) -> Void)? { get { with { $0.onCommitOf } } set { with { $0.onCommitOf = newValue } } }
+    /// Runs inside list, after storage answered and before the engine records the result.
+    var onList: ((String) -> Void)? { get { with { $0.onList } } set { with { $0.onList = newValue } } }
     init(_ root: URL) throws { base = try LocalDirectoryBackend(root: root) }
     func available() throws { if offline { throw DriveError(ENETDOWN, "Fixture offline") } }
     func stat(_ p: String) throws -> FileEntry { with { $0.stats += 1 }; try available(); return try base.stat(p) }
-    func list(_ p: String) throws -> [FileEntry] { try available(); return try base.list(p) }
+    func list(_ p: String) throws -> [FileEntry] {
+        with { $0.lists += 1 }; try available()
+        let entries = try base.list(p)
+        if let hook = onList { onList = nil; hook(p) }
+        return entries
+    }
     func read(_ p: String, offset: Int64, length: Int) throws -> Data {
         try available(); let bytes = try base.read(p, offset: offset, length: length)
         with { $0.readBytes += bytes.count; $0.ranges.append((offset, length)); $0.reads.append((p, offset)) }; return bytes
@@ -223,6 +233,64 @@ final class EngineTests: XCTestCase {
         _ = try reopened.write("/new", offset: 0, data: Data("new".utf8))
         let updatedJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(reopened.stat("/new"))) as! [String: Any]
         XCTAssertEqual((updatedJSON["accessedNanoseconds"] as? NSNumber)?.int64Value, initialAccess)
+    }
+
+    /// With a listing lifetime (ParaAir Cloud), a folder listing answers again without storage until a change drops it
+    /// (this Mac's own change, or one the change feed names) or the lifetime ends. Pending local files still show.
+    func testAFreshListingAnswersWithoutStorageUntilAChangeDropsIt() throws {
+        try seed("a", Data("a".utf8))
+        let drive = try Engine(backend: backend, stateDirectory: state, cacheLimitBytes: 8192, minFreeBytes: 0, blockSize: 4096,
+                               maxJournalBytes: 1 << 20, tuning: EngineTuning(listingLifetimeNanoseconds: 300_000_000))
+        XCTAssertEqual(try drive.list("/").map(\.name), ["a"])
+        XCTAssertEqual(try drive.list("/").map(\.name), ["a"])
+        XCTAssertEqual(backend.lists, 1, "a fresh listing answers without storage")
+        _ = try drive.create("/b", directory: false)
+        XCTAssertEqual(try drive.list("/").map(\.name), ["a", "b"], "a pending local file shows in a reused listing")
+        XCTAssertEqual(backend.lists, 1)
+        try seed("c", Data("c".utf8))
+        _ = try drive.applyRemoteChanges([ParaAirCloudChange(cursor: 1, change: "write", kind: "file", path: "/c", at: "", author: ParaAirCloudAuthor())])
+        XCTAssertEqual(try drive.list("/").map(\.name), ["a", "b", "c"], "a change the feed names drops the listing")
+        XCTAssertEqual(backend.lists, 2)
+        XCTAssertTrue(try drive.flushUploads().isEmpty)
+        _ = try drive.list("/")
+        XCTAssertEqual(backend.lists, 3, "this Mac's own upload drops the listing")
+        _ = try drive.list("/")
+        XCTAssertEqual(backend.lists, 3)
+        usleep(350_000)
+        _ = try drive.list("/")
+        XCTAssertEqual(backend.lists, 4, "after the listing lifetime, storage is asked again")
+        let plain = try engine()
+        _ = try plain.list("/"); _ = try plain.list("/")
+        XCTAssertEqual(backend.lists, 6, "without a listing lifetime (your own storage), every listing asks storage")
+    }
+
+    func testAListingInFlightWhileAnotherProcessPublishesIsNotSaved() throws {
+        try seed("a", Data("a".utf8))
+        let tuning = EngineTuning(listingLifetimeNanoseconds: 60_000_000_000)
+        func open() throws -> Engine {
+            try Engine(backend: backend, stateDirectory: state, cacheLimitBytes: 8192, minFreeBytes: 0, blockSize: 4096,
+                       maxJournalBytes: 1 << 20, tuning: tuning)
+        }
+        // The extension lists "/" while the app (another Engine on the same state) publishes a new file in it.
+        let mount = try open(), app = try open()
+        backend.onList = { _ in
+            do { _ = try app.create("/b", directory: false); XCTAssertTrue(try app.flushUploads().isEmpty) }
+            catch { XCTFail("publishing from the other engine failed: \(error)") }
+        }
+        XCTAssertEqual(try mount.list("/").map(\.name), ["a"], "storage answered before the upload")
+        XCTAssertEqual(try mount.list("/").map(\.name), ["a", "b"], "the earlier answer wasn't saved over the upload")
+        XCTAssertEqual(backend.lists, 2)
+    }
+    func testAPinEnumeratesStorageEvenWithAFreshListing() throws {
+        try seed("a", Data("a".utf8))
+        let drive = try Engine(backend: backend, stateDirectory: state, cacheLimitBytes: 1 << 20, minFreeBytes: 0, blockSize: 4096,
+                               maxJournalBytes: 1 << 20, tuning: EngineTuning(listingLifetimeNanoseconds: 60_000_000_000))
+        XCTAssertEqual(try drive.list("/").map(\.name), ["a"])
+        try seed("c", Data("c".utf8)) // added on another Mac; the feed hasn't arrived
+        let before = backend.lists
+        try drive.pin("/")
+        XCTAssertGreaterThan(backend.lists, before, "a pin lists storage rather than the saved listing")
+        XCTAssertEqual(try drive.list("/").map(\.name), ["a", "c"])
     }
 
     func testListingIsMetadataOnlyAndDistantReadFetchesOneBlock() throws {

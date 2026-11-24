@@ -75,11 +75,21 @@ public struct ReadaheadPolicy: Sendable, Equatable {
 public struct EngineTuning: Sendable, Equatable {
     public var readahead: ReadaheadPolicy
     public var metadataLifetimeNanoseconds: Int64
-    public init(readahead: ReadaheadPolicy = .disabled, metadataLifetimeNanoseconds: Int64 = 1_000_000_000) {
+    /// How long a folder listing from storage answers `list` again without asking storage. Zero: always ask. Every
+    /// change this Mac makes, and every change the change feed names (applyRemoteChanges), drops saved listings at once,
+    /// so this is only a safety net for changes no feed reported.
+    public var listingLifetimeNanoseconds: Int64
+    public init(readahead: ReadaheadPolicy = .disabled, metadataLifetimeNanoseconds: Int64 = 1_000_000_000,
+                listingLifetimeNanoseconds: Int64 = 0) {
         self.readahead = readahead; self.metadataLifetimeNanoseconds = metadataLifetimeNanoseconds
+        self.listingLifetimeNanoseconds = listingLifetimeNanoseconds
     }
     public static let byo = EngineTuning()
-    public static let paraairCloud = EngineTuning(readahead: .standard, metadataLifetimeNanoseconds: 5_000_000_000)
+    /// ParaAir Cloud has a change feed the app follows every 3 s, which drops what it names at once, so listings and
+    /// file details are reused for 30 s. Both lifetimes match: a reused listing doesn't refresh its files' details, and
+    /// a shorter detail lifetime would send every stat of a walk to storage.
+    public static let paraairCloud = EngineTuning(readahead: .standard, metadataLifetimeNanoseconds: 30_000_000_000,
+                                                  listingLifetimeNanoseconds: 30_000_000_000)
 }
 
 /// Which pending files one flush may publish. `.background` uploads only files that
@@ -251,6 +261,8 @@ private struct Block: Codable {
     var accessed: Int64
 }
 private struct Metadata: Codable { var entry: FileEntry; var verified: Int64 }
+/// When a saved folder listing ("listing") was fetched: the start of the request that returned it.
+private struct ListingStamp: Codable { var verified: Int64 }
 /// A file or folder the change feed (or a change made outside the mount) named, kept until the mounted drive's
 /// extension takes it (takeRemoteChanges) and drops the kernel's caches for it. Older than 10 minutes, it is pruned.
 private struct RemoteChangedPath: Codable { var path: String; var at: Int64 }
@@ -277,6 +289,10 @@ private struct FeedCursor: Codable { var cursor: Int64 }
 /// nanoseconds. It is shared by every process on the drive's state (the app follows the feed, the extension serves
 /// the mount), so a stat or listing any of them began earlier doesn't record what it fetched.
 private struct RemoteInvalidation: Codable { var at: Int64 }
+/// When saved listings were last dropped (invalidateListings), stored as ("feed", "listings"): wall-clock nanoseconds,
+/// shared like RemoteInvalidation. A listing a request began earlier, in any process on the drive's state, may predate
+/// the change that dropped them, so it isn't saved.
+private struct ListingsDropped: Codable { var at: Int64 }
 /// Stored as record ("index", "backup"). `notNeeded` once storage reports that the
 /// index is not local, so no further changes are tracked.
 private struct IndexBackupState: Codable {
@@ -548,19 +564,31 @@ public final class Engine {
             _ = try currentEntry(path) // ENOENT when absent
             throw DriveError(ENOTDIR, "Not a directory")
         }
-        let (started, epoch) = try lock.withLock(timeout: 10) { (now(), namespaceEpoch) }
+        let (started, epoch, fresh) = try lock.withLock(timeout: 10) { () -> (Int64, UInt64, [FileEntry]?) in
+            let clock = now()
+            // A listing fetched within the listing lifetime, and not dropped since by a change, answers without storage.
+            // A pin always enumerates storage, so it never completes on a listing older than what storage holds.
+            guard exceptPin == nil, tuning.listingLifetimeNanoseconds > 0, let stamp: ListingStamp = try db.get("listingat", path),
+                  clock - stamp.verified < tuning.listingLifetimeNanoseconds, try !invalidatedSince(stamp.verified),
+                  try !listingsDroppedSince(stamp.verified),
+                  let saved: [FileEntry] = try db.get("listing", path) else { return (clock, namespaceEpoch, nil) }
+            return (clock, namespaceEpoch, saved)
+        }
         var entries: [FileEntry]
-        do {
+        if let fresh {
+            entries = fresh.filter { !Housekeeping.hides($0) }
+        } else { do {
             entries = try backend.list(path).filter { !Housekeeping.hides($0) }
             try lock.withLock(timeout: 10) {
                 offline = false
-                guard namespaceEpoch == epoch, try !invalidatedSince(started) else { return }
+                guard namespaceEpoch == epoch, try !invalidatedSince(started), try !listingsDroppedSince(started) else { return }
                 try db.transaction {
                     if let previous: [FileEntry] = try db.get("listing", path), Set(previous.map(\.path)) != Set(entries.map(\.path)) {
                         try invalidatePins(under: path, except: exceptPin)
                     }
                     for entry in entries { try recordFetched(entry, started: started, exceptPin: exceptPin) }
                     try db.put("listing", path, entries)
+                    try db.put("listingat", path, ListingStamp(verified: started))
                 }
             }
         } catch {
@@ -568,7 +596,7 @@ public final class Engine {
             try lock.withLock(timeout: 10) { offline = true }
             // Listings saved by earlier versions may still name housekeeping files.
             entries = saved.filter { !Housekeeping.hides($0) }
-        }
+        } }
         return try lock.withLock(timeout: 10) {
             let pending: [Journal] = try db.all("journal")
             var byPath = Dictionary(entries.map { ($0.path, $0) }, uniquingKeysWith: { _, last in last })
@@ -1298,7 +1326,17 @@ public final class Engine {
         let pending: [Journal] = try lock.withLock { try db.all("journal") }
         for item in pending where paths.contains(where: { contains($0, item.path) }) { try syncOne(item.path) }
     }
-    private func invalidateListings() throws { try db.clear("listing") }
+    /// Drops every saved listing and records when, so a listing another request or process began earlier isn't saved
+    /// over the change (listingsDroppedSince).
+    private func invalidateListings() throws {
+        try db.clear("listing"); try db.clear("listingat")
+        try db.put("feed", "listings", ListingsDropped(at: now()))
+    }
+    /// Under the state lock: whether saved listings were dropped at or after `started`, by this or another process.
+    private func listingsDroppedSince(_ started: Int64) throws -> Bool {
+        guard let mark: ListingsDropped = try db.get("feed", "listings") else { return false }
+        return mark.at >= started
+    }
     /// Marks pins covering `path` incomplete. A pin in progress learns of it at completion.
     private func invalidatePins(under path: String, except pinning: String? = nil) throws {
         // Finder rewriting .DS_Store in a pinned folder changes nothing a pin holds.
