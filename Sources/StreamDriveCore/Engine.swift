@@ -60,6 +60,8 @@ public struct RemoteChangeBatch: Sendable {
     public var folders: [String]
     public var reset: Bool
     public var cursor: Int64
+    /// The feed had more after `cursor` than one pass reads (maxPages): follow again soon.
+    public var more = false
 }
 
 /// Sequential prefetch window; `maxBlocks == 0` disables readahead.
@@ -85,8 +87,9 @@ public struct EngineTuning: Sendable, Equatable {
         self.listingLifetimeNanoseconds = listingLifetimeNanoseconds
     }
     public static let byo = EngineTuning()
-    /// ParaAir Cloud has a change feed the app follows (FeedPollSchedule: every 3 s while changes arrive, up to a minute
-    /// apart when quiet), and it drops what it names at once, so listings and file details are reused for 2 minutes:
+    /// ParaAir Cloud has a change feed the app follows (when the drive's change stream says a change committed; while the
+    /// stream is down, FeedPollSchedule: every 3 s while changes arrive, up to a minute apart when quiet), and it drops
+    /// what it names at once, so listings and file details are reused for 2 minutes:
     /// a folder an app keeps re-reading costs storage a request every 2 minutes, not every few seconds. The lifetime
     /// only bounds how stale a listing can get if the feed stops (the app quit, the network is down). Both lifetimes
     /// match: a reused listing doesn't refresh its files' details, and a shorter detail lifetime would send every stat
@@ -1842,13 +1845,14 @@ public final class Engine {
     public func followChanges(consumer: String, maxPages: Int = 10) throws -> RemoteChangeBatch? {
         guard try backend.collaboration() != nil else { return nil }
         let saved: FeedCursor? = try lock.withLock(timeout: 10) { try db.get("feed", consumer) }
-        var cursor: Int64, changes: [ParaAirCloudChange] = [], folders: [String] = [], reset = false
+        var cursor: Int64, changes: [ParaAirCloudChange] = [], folders: [String] = [], reset = false, more = false
         if let start = saved?.cursor {
             cursor = start
             for _ in 0..<max(1, maxPages) {
                 let (page, named) = try pullChanges(since: cursor, limit: 500)
                 cursor = page.cursor
-                if page.reset { reset = true; changes = []; folders = named; break }
+                more = page.more
+                if page.reset { reset = true; more = false; changes = []; folders = named; break }
                 changes += page.changes
                 for folder in named where !folders.contains(folder) { folders.append(folder) }
                 if !page.more { break }
@@ -1858,7 +1862,14 @@ public final class Engine {
         }
         let reached = cursor
         try lock.withLock(timeout: 10) { try db.put("feed", consumer, FeedCursor(cursor: reached)) }
-        return RemoteChangeBatch(changes: changes, folders: folders, reset: reset, cursor: reached)
+        return RemoteChangeBatch(changes: changes, folders: folders, reset: reset, cursor: reached, more: more)
+    }
+
+    /// The drive's change stream (ParaAirCloudChangeStream), not started: `handler` hears the newest cursor the service
+    /// knows of, then each committed change's cursor, then `.closed` once. A cursor beyond the one `followChanges` last
+    /// reached means there is something to follow. Nil for storage that can't push.
+    public func changeStream(_ handler: @escaping @Sendable (ParaAirCloudChangeStream.Event) -> Void) throws -> ParaAirCloudChangeStream? {
+        try backend.collaboration()?.changeStream(handler)
     }
 
     /// Forgets what this Mac remembers about `path` after a change made in storage directly, such as a restored

@@ -379,9 +379,9 @@ final class CLIApplication {
             }
             return try render(info, invocation: invocation,
                               text: "Copy of \(displayName(info.original)): based on \(info.baseVersion ?? "a new file"), lost to \(info.theirsVersion ?? "an unknown version").\n")
-        case .changes(let target, let follow, let since, let interval):
+        case .changes(let target, let follow, let since, let interval, let push):
             let resolved = try resolve(target, invocation: invocation)
-            return try changes(resolved, follow: follow, since: since, interval: interval ?? 3, json: invocation.json)
+            return try changes(resolved, follow: follow, since: since, interval: interval ?? 3, push: push, json: invocation.json)
         case .access(let action, let target):
             let resolved = try resolve(target, invocation: invocation)
             let profile = try cloudOnly(resolved.profile)
@@ -661,23 +661,30 @@ final class CLIApplication {
     /// `changes`: with --json one JSON object per line, as the service sends each change; a `reset` line when changes
     /// were pruned (rescan, then follow on); with --follow, first a `following` line with the cursor it starts from.
     /// Each page's paths are dropped from this Mac's caches first, so reading them through the mount right after a line
-    /// gets the new contents. Only changes at or under the target's folder are printed.
-    private func changes(_ resolved: ResolvedTarget, follow: Bool, since: Int64?, interval: Int, json: Bool) throws -> CLIExecution {
+    /// gets the new contents. Only changes at or under the target's folder are printed. With --push, a followed feed
+    /// waits for the drive's change stream to tell of a new cursor instead of polling, and polls every `interval`
+    /// seconds only while the stream is down (ChangeNotices).
+    private func changes(_ resolved: ResolvedTarget, follow: Bool, since: Int64?, interval: Int, push: Bool, json: Bool) throws -> CLIExecution {
         // A follower outlives whoever started it if that process quits or crashes (it is reparented to launchd) and
         // would only notice at its next line. The parent is taken first, before opening the drive or asking for a
         // cursor, so a launcher that dies meanwhile is still noticed; a reader already gone means nothing to do.
         let parent = system.parentProcess()
-        guard follow else { return try changesFeed(resolved, follow: false, since: since, interval: interval, json: json, parent: parent) }
+        guard follow else {
+            return try changesFeed(resolved, follow: false, since: since, interval: interval, push: false, json: json, parent: parent)
+        }
         system.ignoreBrokenPipe()
         if system.outputClosed() { return CLIExecution(stdout: "", stderr: "", exitCode: 0) }
-        do { return try changesFeed(resolved, follow: true, since: since, interval: interval, json: json, parent: parent) }
+        do { return try changesFeed(resolved, follow: true, since: since, interval: interval, push: push, json: json, parent: parent) }
         catch let error as DriveError where error.code == EPIPE {
             // The reader closed between the check and a write: that is the end of following, not a failure.
             return CLIExecution(stdout: "", stderr: "", exitCode: 0)
         }
     }
-    private func changesFeed(_ resolved: ResolvedTarget, follow: Bool, since: Int64?, interval: Int, json: Bool, parent: pid_t) throws -> CLIExecution {
+    private func changesFeed(_ resolved: ResolvedTarget, follow: Bool, since: Int64?, interval: Int, push: Bool, json: Bool,
+                             parent: pid_t) throws -> CLIExecution {
         let engine = try open(cloudOnly(resolved.profile), root: resolved.root), folder = resolved.path
+        let notices = follow && push ? ChangeNotices(open: { try engine.changeStream($0) }) : nil
+        defer { notices?.close() }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         func emit<T: Encodable>(_ value: T, text: String) throws {
             try output(json ? try encoder.encode(value) + Data("\n".utf8) : Data((text + "\n").utf8))
@@ -702,6 +709,7 @@ final class CLIApplication {
                 return CLIExecution(stdout: "", stderr: "", exitCode: 0)
             }
             let page: ParaAirCloudChangePage, folders: [String]
+            notices?.pulling()
             do { (page, folders) = try engine.readChangesAndFolders(since: cursor) ; failures = 0 }
             catch let error as DriveError where follow && Self.passing(error) {
                 // Offline or the service is busy: keep following, waiting longer each time, up to a minute.
@@ -719,7 +727,13 @@ final class CLIApplication {
             guard follow else { return CLIExecution(stdout: "", stderr: "", exitCode: 0) }
             polls += 1
             if let limit = maxFollowPolls, polls >= limit { return CLIExecution(stdout: "", stderr: "", exitCode: 0) }
-            system.sleep(TimeInterval(interval))
+            if let notices {
+                // A healthy stream on a quiet drive means no poll for minutes: check for a gone parent or reader
+                // at least every `interval` seconds while waiting too (the check at the top of the loop then ends it).
+                notices.wait(after: cursor, poll: TimeInterval(interval), gone: { self.system.parentProcess() != parent || self.system.outputClosed() })
+            } else {
+                system.sleep(TimeInterval(interval))
+            }
         }
     }
 
@@ -965,6 +979,10 @@ struct SetupStatus: Encodable {
     /// and codes are added; a rename or removal is a new version. Integrations gate on this, not on the app's build.
     static let currentContractVersion = 1
     var contractVersion = SetupStatus.currentContractVersion
+    /// Additions within the contract version that an integration may want to check before using them (open set):
+    /// `changes.push`, `changes --follow --push`.
+    static let currentCapabilities = ["changes.push"]
+    var capabilities = SetupStatus.currentCapabilities
     struct App: Encodable { var installed: Bool; var path: String?; var running: Bool; var version: String?; var build: String? }
     /// `otherCopies`: other registered copies of the app that still exist. macOS can pick the wrong copy's extension,
     /// so a setup guide asks the person to keep only the installed one.
