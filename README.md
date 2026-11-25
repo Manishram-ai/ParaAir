@@ -239,6 +239,8 @@ paraair members remove --cloud-account ID --workspace WS --email person@example.
 - Only owners make owners. Admins can't change or remove an owner, and members and viewers can't manage members (exit 12). The last owner can't be demoted or removed (exit 1). A workspace the account isn't in exits 14.
 - `add` and `remove` are sent once. When the answer is lost (a server error or a dropped connection) they exit 1 with an error ending in "check members list", since the change may have happened: run `members list` before trying again.
 
+In the app, a team drive's Storage Settings has a **Members** section with the same routes and rules: its owners and admins see the workspace's seats ("4 of 5 seats used") and its members, invite by email (with or without the invitation email), change roles and remove people; members and viewers see who manages it. Your own row isn't changed there, and admins can't change or remove owners or make new ones. Invitations and removals are sent once; when the answer is lost the list reloads and the app says to check it before trying again. A full Team with a live subscription asks before an invitation adds a paid seat (the service bills it at once); any other full workspace offers no invitation.
+
 ## Storage, cache and write semantics
 
 ```mermaid
