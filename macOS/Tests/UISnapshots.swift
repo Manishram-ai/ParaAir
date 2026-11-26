@@ -2024,16 +2024,16 @@ struct UISnapshots {
         try bitmap.representation(using: .png, properties: [:])?.write(to: url)
     }
 
-    /// The ink button sits beside glass ones in a row, so both take the capsule height for their control size.
+    /// The ink button sits beside outlined ones in a row, so both take the capsule height for their control size.
     @MainActor
     static func checkButtonHeights() -> [String] {
         var failures: [String] = []
         for (name, size) in [("small", ControlSize.small), ("regular", .regular), ("large", .large), ("extraLarge", .extraLarge)] {
             let ink = NSHostingView(rootView: Button("Open System Settings") {}.buttonStyle(.airProminent).controlSize(size)).fittingSize.height
-            let glass = NSHostingView(rootView: Button("Check Again") {}.buttonStyle(.airGlass).controlSize(size)).fittingSize.height
+            let outline = NSHostingView(rootView: Button("Check Again") {}.buttonStyle(.airOutline).controlSize(size)).fittingSize.height
             let expected = AirButtonMetrics(size).height
-            if ink != expected || glass != expected {
-                failures.append("button height (\(name)): ink \(ink), glass \(glass), expected \(expected)")
+            if ink != expected || outline != expected {
+                failures.append("button height (\(name)): ink \(ink), outline \(outline), expected \(expected)")
             }
         }
         return failures
@@ -2119,7 +2119,7 @@ struct UISnapshots {
 
     @MainActor
     static func render<V: View>(_ view: V, size: CGSize?, appearance: NSAppearance.Name, to url: URL) throws {
-        // Ambient motion (the airflow drift, the working shimmer) holds still, so captures show the resting frame.
+        // Ambient motion (the lead plane's entrance, the working shimmer) holds still, so captures show the resting frame.
         let host = NSHostingView(rootView: view.environment(\.controlActiveState, .key).environment(\.airAmbientMotion, false))
         let frameSize = size ?? host.fittingSize
         host.frame = NSRect(origin: .zero, size: frameSize)
