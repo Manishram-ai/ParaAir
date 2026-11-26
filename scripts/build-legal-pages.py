@@ -314,10 +314,11 @@ def footer(current):
   </footer>"""
 
 
-def page(slug_, title, description, body, current, root="", indexed=True):
+def page(slug_, title, description, body, current, root="", indexed=True, script="legal.js", body_class="legal-page"):
     """`root` prefixes the page's own assets: "/" for 404.html, which is served at any unknown path. Links between pages
     are root-relative and extensionless everywhere. A page that is not indexed (404.html) gets noindex instead of a
-    canonical address and a link preview."""
+    canonical address and a link preview. `script` and `body_class`: 404.html takes the landing hero, flown by
+    motion.js, instead of the legal layout."""
     full_title = f"{title} · ParaAir"
     url = f"{SITE}/{slug_}"
     # The preview's title drops the " · ParaAir" suffix when the title already names ParaAir (og:site_name has it).
@@ -335,12 +336,12 @@ def page(slug_, title, description, body, current, root="", indexed=True):
   <link rel="icon" href="{root}glide.svg" type="image/svg+xml">
   <link rel="stylesheet" href="{root}styles.css">
 </head>
-<body class="legal-page">
+<body{f' class="{body_class}"' if body_class else ''}>
   <a class="skip" href="#main">Skip to content</a>
 {masthead(root)}
 {body}
 {footer(current)}
-  <script src="{root}legal.js" defer></script>
+  <script src="{root}{script}" defer></script>
 </body>
 </html>
 """
@@ -390,13 +391,23 @@ def index_page(effective):
 
 
 def not_found_page():
-    body = """  <main id="main" class="legal legal-missing">
-    <div class="legal-head">
-      <h1>There\u2019s no page here.</h1>
-      <p class="doc-meta">The link may be old, or the address mistyped. Try the <a href="/">ParaAir home page</a>, <a href="/pricing">pricing</a> or <a href="/legal">legal documents</a>.</p>
-    </div>
+    """The landing page's hero (site/index.html), so motion.js flies it the same way: the headline at poster size with
+    the lead plane flying in under its last words, the grey flock in the open air, the way back at the foot."""
+    body = """  <canvas class="sky" data-sky aria-hidden="true"></canvas>
+  <main id="main">
+    <section class="hero" aria-labelledby="missing-title" data-flight="hero">
+      <h1 id="missing-title">There\u2019s no <span class="under" data-under>page&nbsp;here.</span></h1>
+      <div class="hero-foot">
+        <p class="lede">The link may be old, or the address&nbsp;mistyped.</p>
+        <div class="hero-action">
+          <a class="cta" href="/">Go to the home page</a>
+          <p class="requires">Or try <a href="/pricing">pricing</a> or the <a href="/legal">legal documents</a>.</p>
+        </div>
+      </div>
+    </section>
   </main>"""
-    return page("404", "Page not found", "This page does not exist.", body, "", root="/", indexed=False)
+    return page("404", "Page not found", "This page does not exist.", body, "", root="/", indexed=False,
+                script="motion.js", body_class="")
 
 
 def main():
