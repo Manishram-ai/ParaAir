@@ -43,6 +43,8 @@ struct CloudPlanSheet: View {
     enum Step: Equatable { case choose, review }
 
     @ObservedObject var model: CloudAccountModel
+    /// The drive's team members, whose list can arrive after the sheet opened (or after the terms loaded).
+    @ObservedObject private var members: CloudMembersModel
     @State private var step: Step
     @State private var plan: ParaAirCloudBilling.Plan
     @State private var interval: ParaAirCloudBilling.Interval
@@ -52,16 +54,23 @@ struct CloudPlanSheet: View {
     @State private var agrees: Bool
     @State private var showsFullTerms = false
     @State private var confirmingStartOver = false
+    /// The person picked a plan or set the seats: an offer arriving later doesn't change them.
+    @State private var planChosen: Bool
+    @State private var seatsChosen: Bool
 
     /// The arguments past `model` set a starting state for the offscreen snapshot harness.
     init(model: CloudAccountModel, step: Step = .choose, plan: ParaAirCloudBilling.Plan? = nil, interval: ParaAirCloudBilling.Interval = .month,
          seats: Int? = nil, agreed: Bool = false, fullTerms: Bool = false) {
         self.model = model
+        _members = ObservedObject(wrappedValue: model.members)
         let choice = model.planChoice
         _step = State(initialValue: step)
-        _plan = State(initialValue: plan ?? (choice.personal.available || !choice.team.available ? .personal : .team))
+        // A team drive starts on Team for its team, when Team can be bought for it.
+        _plan = State(initialValue: plan ?? CloudPlanChoice.initialPlan(choice, driveKind: model.workspace?.kind))
         _interval = State(initialValue: interval)
-        _seats = State(initialValue: seats ?? CloudPlanChoice.defaultSeats(choice.team.workspaces.first))
+        _seats = State(initialValue: seats ?? CloudPlanChoice.defaultSeats(choice.team.workspaces.first, members: model.members.members))
+        _planChosen = State(initialValue: plan != nil)
+        _seatsChosen = State(initialValue: seats != nil)
         _teamWorkspaceID = State(initialValue: choice.team.workspaces.first?.id)
         _agrees = State(initialValue: agreed)
         _showsFullTerms = State(initialValue: fullTerms)
@@ -98,6 +107,8 @@ struct CloudPlanSheet: View {
         .airSurface()
         .onChange(of: model.quote) { _, _ in agrees = false }
         .onChange(of: model.offer) { _, _ in adoptOffer() }
+        .onChange(of: teamWorkspaceID) { _, _ in adoptSeats() }
+        .onChange(of: members.members) { _, _ in adoptSeats() }
         .confirmationDialog("Start over with a new payment page?", isPresented: $confirmingStartOver, titleVisibility: .visible) {
             Button("Start Over") { step = .choose; model.startOver() }
             Button("Cancel", role: .cancel) {}
@@ -107,12 +118,29 @@ struct CloudPlanSheet: View {
         }
     }
 
-    /// The offer arrived after the sheet opened: start on a plan that is on sale, and on the first team that can buy one.
+    /// The offer arrived after the sheet opened: start on the plan for the drive's own workspace when it is on sale
+    /// (else one that is), and on the first team that can buy one, the drive's team first.
     private func adoptOffer() {
         let other: ParaAirCloudBilling.Plan = plan == .personal ? .team : .personal
-        if !choice.option(plan).available, choice.option(other).available { plan = other }
+        if !planChosen { plan = CloudPlanChoice.initialPlan(choice, driveKind: model.workspace?.kind) }
+        else if !choice.option(plan).available, choice.option(other).available { plan = other }
         if teamWorkspaceID == nil || !choice.team.workspaces.contains(where: { $0.id == teamWorkspaceID }) {
             teamWorkspaceID = choice.team.workspaces.first?.id
+        }
+        adoptSeats()
+    }
+
+    /// Seats start at what the chosen team's members use, until the person sets them, also when the members list
+    /// arrives later. Terms already on screen were for the old count, so they are asked for again and the box unticked
+    /// (review 2026-11-26): the service refuses fewer seats than members.
+    private func adoptSeats() {
+        guard let next = CloudPlanChoice.adoptedSeats(seats, chosen: seatsChosen,
+                                                      team: choice.team.workspaces.first { $0.id == teamWorkspaceID },
+                                                      members: members.members) else { return }
+        seats = next
+        if step == .review, plan == .team {
+            agrees = false
+            model.loadQuote(selection, force: true)
         }
     }
 
@@ -175,19 +203,18 @@ struct CloudPlanSheet: View {
                       options: [(ParaAirCloudBilling.Interval.month, "Monthly"), (.year, "Yearly")])
         HStack(alignment: .top, spacing: 12) {
             PlanCard(option: choice.personal,
-                     offer: CloudPlanOffer.make(.personal, interval: interval, seats: 1, offer: offer) ?? .unpriced(.personal, interval: interval),
+                     offer: CloudPlanOffer.card(.personal, interval: interval, seats: 1, available: choice.personal.available, offer: offer),
                      selected: plan == .personal) {
-                plan = .personal
+                plan = .personal; planChosen = true
             } footer: {
                 EmptyView()
             }
             PlanCard(option: choice.team,
-                     offer: (choice.team.available ? CloudPlanOffer.make(.team, interval: interval, seats: seats, offer: offer)
-                             : CloudPlanOffer.perSeat(interval: interval, offer: offer)) ?? .unpriced(.team, interval: interval),
+                     offer: CloudPlanOffer.card(.team, interval: interval, seats: seats, available: choice.team.available, offer: offer),
                      selected: plan == .team) {
-                plan = .team
+                plan = .team; planChosen = true
             } footer: {
-                Stepper(value: $seats, in: 1...ParaAirCloudBillingCatalog.maxSeats) {
+                Stepper(value: Binding(get: { seats }, set: { seats = $0; seatsChosen = true }), in: 1...ParaAirCloudBillingCatalog.maxSeats) {
                     Text(seats == 1 ? "1 seat" : "\(seats) seats").monospacedDigit()
                 }
                 .accessibilityLabel("Team seats")

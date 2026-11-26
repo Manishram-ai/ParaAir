@@ -25,6 +25,8 @@ struct UISnapshots {
         failures += checkUpdateGate()
         failures += checkButtonHeights()
         failures += checkLegalLinks()
+        failures += checkLaunchGaps()
+        failures += try checkDiagnosticsHelper()
 
         for (name, input) in homeScenarios {
             for appearance in [NSAppearance.Name.aqua, .darkAqua]
@@ -102,6 +104,197 @@ struct UISnapshots {
             }
         }
         expect(AboutView.pages == LegalLinks.about, "the About window links every About page")
+        return failures
+    }
+
+    /// The release review of 2026-11-26: Team where the service doesn't sell it, Get Help… and Copy Diagnostics, the
+    /// sign-out and account deletion wording about files still waiting to upload, and the Team seat default.
+    static func checkLaunchGaps() -> [String] {
+        var failures: [String] = []
+        func expect(_ condition: Bool, _ message: String) { if !condition { failures.append("launch gaps: " + message) } }
+
+        // Get Help…: an email to support with the version and build filled in, every field percent-encoded.
+        let mail = SupportLinks.helpEmail(version: AppVersionText(title: "0.1.0 alpha 11", build: "72"), system: "Version 27.3 (Build 27D60)")
+        let parts = mail.absoluteString.split(separator: "?", maxSplits: 1).map(String.init)
+        let fields = Dictionary(uniqueKeysWithValues: (parts.count == 2 ? parts[1] : "").split(separator: "&").map { field -> (String, String) in
+            let pair = field.split(separator: "=", maxSplits: 1).map(String.init)
+            return (pair[0], pair.count == 2 ? pair[1].removingPercentEncoding ?? "" : "")
+        })
+        expect(SupportLinks.email == "support@parafield.ai" && parts.first == "mailto:support@parafield.ai", "Get Help… writes to support@parafield.ai")
+        expect(Set(fields.keys) == ["subject", "body"], "the email has a subject and a body only")
+        expect(fields["subject"] == "ParaAir help (0.1.0 alpha 11 (72))", "the subject names the version and build")
+        expect(fields["body"]?.contains("ParaAir 0.1.0 alpha 11, build 72\r\nmacOS: Version 27.3 (Build 27D60)") == true, "the body names the version, build and macOS")
+        expect(fields["body"]?.contains("Copy Diagnostics") == true, "the body says where Copy Diagnostics is")
+        let tricky = SupportLinks.helpEmail(version: AppVersionText(title: "1.0 & more=yes?", build: nil), system: "x")
+        expect(!tricky.absoluteString.dropFirst("mailto:".count).contains("& more") && tricky.query?.components(separatedBy: "&").count == 2,
+               "a version can't add fields to the email")
+        expect(SupportButtons.line(.copied)?.hasPrefix("Diagnostics copied") == true && SupportButtons.line(.idle) == nil, "copying says it worked")
+
+        // Sign Out Anyway: the waiting files stay on this Mac, and only those that are waiting, need the sign-in or are being
+        // retried resume uploading after signing in again. Conflicts, a full plan, another Mac or a role still need review.
+        expect(CloudSignOutText.message(UploadActivity(waiting: 3)) == "3 files on this Mac haven’t uploaded yet. If you sign out anyway, they stay on this Mac "
+               + "and resume uploading after you sign in again with this account.", "sign-out says waiting files stay and resume later")
+        expect(CloudSignOutText.message(UploadActivity(blockedAuth: 1)) == "1 file on this Mac hasn’t uploaded yet. If you sign out anyway, it stays on this Mac "
+               + "and resumes uploading after you sign in again with this account.", "one file is singular")
+        expect(CloudSignOutText.message(UploadActivity(waiting: 1, blockedQuota: 1, blockedAuth: 1, blockedElsewhere: 1, conflicts: 2))
+               == "6 files on this Mac haven’t uploaded yet. If you sign out anyway, they stay on this Mac. 2 of them resume uploading after you sign in "
+               + "again with this account; the other 4 are blocked or conflict with other changes and still need your review.",
+               "only the files that can upload are promised to; the rest need review")
+        expect(CloudSignOutText.message(UploadActivity(waiting: 1, conflicts: 1)).hasSuffix("1 of them resumes uploading after you sign in again with this account; "
+               + "the other one is blocked or conflicts with another change and still needs your review."), "one of each is singular")
+        expect(CloudSignOutText.message(UploadActivity(blockedQuota: 1, conflicts: 2))
+               == "3 files on this Mac haven’t uploaded yet. If you sign out anyway, they stay on this Mac. They’re blocked or conflict with other changes, "
+               + "so they still need your review after you sign in again with this account.", "conflicts and a full plan aren't promised to upload")
+        expect(CloudSignOutText.message(UploadActivity(conflicts: 1)).hasSuffix("It’s blocked or conflicts with another change, so it still needs your review "
+               + "after you sign in again with this account."), "one blocked file is singular")
+        let failingUploads = UploadActivity(failedOther: 1, failure: UploadFailureSummary(count: 2, errno: EIO, oldestChangeNanoseconds: 1))
+        expect(CloudSignOutText.resumable(failingUploads) == 3 && CloudSignOutText.message(failingUploads).hasSuffix("and resume uploading after you sign in again with this account."),
+               "uploads being retried resume after signing in again")
+        expect(CloudSignOutText.message(UploadActivity()).hasPrefix("This Mac stops reaching ParaAir Cloud")
+               && CloudSignOutText.message(nil).hasPrefix("This Mac stops reaching ParaAir Cloud"), "nothing waiting keeps the plain message")
+
+        // Account deletion: files still waiting to upload to any of the account's drives on this Mac.
+        expect(CloudAccountDeletionText.waitingUploads(2) == "2 files on this Mac haven’t uploaded yet. They can’t upload once the account is deleted: "
+               + "wait for them to upload, or copy them out of the drive in Finder, before you confirm.", "deletion names the waiting files")
+        expect(CloudAccountDeletionText.waitingUploads(1)?.hasPrefix("1 file on this Mac hasn’t uploaded yet. It can’t") == true, "one file is singular")
+        expect(CloudAccountDeletionText.waitingUploads(0) == nil, "nothing waiting, no line")
+        expect(CloudAccountDeletionText.waitingUploads(nil)?.hasPrefix("Files on this Mac that haven’t uploaded yet") == true, "an unknown count still warns")
+
+        // Team where the service doesn't sell it (Stripe Managed Payments): no Team price in either period.
+        let teamID = "ws_01J9ZX5Q4WJ3M8K2V7N6R1T0YD"
+        let fullOffer = OfferBox().fixture(nil)
+        let managed = OfferBox(provider: .stripe, managed: true, sellsTeam: false).fixture(nil)
+        expect(!managed.sells(.team) && managed.sells(.personal), "the Managed Payments fixture sells Personal only")
+        let personalWorkspace = fixtureMe(stored: 1, billing: billingBeta)
+        let withTeam = fixtureMe(stored: 1, billing: billingBeta, extra: [fixtureTeam(billing: ParaAirCloudBilling(provider: .stripe, status: .none))])
+        let notSoldChoice = CloudPlanChoice.make(withTeam, preferredWorkspaceID: fixtureWorkspaceID, offer: managed)
+        expect(notSoldChoice.team.reason == "Team isn’t available yet." && !notSoldChoice.team.available, "Team isn't available yet")
+        expect(CloudPlanChoice.make(personalWorkspace, preferredWorkspaceID: nil, offer: managed).team.reason == "Team isn’t available yet.",
+               "not sold comes before having no team workspace")
+        let notSoldCard = CloudPlanOffer.card(.team, interval: .month, seats: 1, available: false, offer: managed)
+        expect(notSoldCard == .notSold(.team) && notSoldCard.price == "Not available yet" && !notSoldCard.detail.contains("other billing period"),
+               "the Team card never says to try the other billing period when neither is sold")
+        expect(CloudPlanOffer.card(.team, interval: .year, seats: 1, available: false, offer: managed) == .notSold(.team), "nor yearly")
+        var yearlyTeam = fullOffer
+        yearlyTeam.prices.removeAll { $0.item == "team_month" }
+        expect(CloudPlanOffer.card(.team, interval: .month, seats: 1, available: false, offer: yearlyTeam).detail == "Try the other billing period",
+               "a plan sold in the other period still says so")
+        expect(CloudPlanOffer.card(.team, interval: .month, seats: 3, available: true, offer: fullOffer).price == "$48 per month", "a sold Team card keeps its price")
+
+        // A team drive offers Choose a Plan… only when the team itself can check out, never the Personal-only sheet.
+        func teamDrive(_ billing: ParaAirCloudBilling, unpaid: Bool = true, role: String = "owner", choice: Bool = true) -> CloudBillingPresentation {
+            CloudBillingPresentation.make(fixtureMe(stored: unpaid ? 0 : 1, retained: 0, transfer: 0, billing: billing, kind: "team", role: role,
+                                                    unpaid: unpaid).workspaces.first, state: .loaded, planChoiceAvailable: choice)
+        }
+        let teamOff = ParaAirCloudBilling(provider: .stripe, status: .none)
+        let noTeam = teamDrive(teamOff)
+        expect(noTeam.controls.isEmpty, "a team drive whose team can't buy a plan offers no Choose a Plan…")
+        expect(noTeam.notice?.text == CloudBillingPresentation.teamUnavailable && noTeam.noStorageDetail == CloudBillingPresentation.teamUnavailable,
+               "the team's owner is told Team isn't available and a Personal plan doesn't cover the team")
+        expect(teamDrive(teamOff, unpaid: false).controls.isEmpty, "nor from a team drive with an admin-set plan")
+        expect(teamDrive(teamOff, role: "member").notice?.text == "This workspace has no storage yet. Ask the workspace owner to choose a plan."
+               && teamDrive(teamOff, role: "member").noStorageDetail == nil, "a member is still sent to the owner")
+        // The owner already pays for Personal, so no workspace of the account can check out (`planChoiceAvailable` false):
+        // still Team isn't sold, never "Choose a plan" with no button (review 2026-11-26).
+        expect(teamDrive(teamOff, choice: false).notice?.text == CloudBillingPresentation.teamUnavailable
+               && teamDrive(teamOff, choice: false).controls.isEmpty, "Team not sold, whatever the account's other workspaces can buy")
+        expect(teamDrive(ParaAirCloudBilling(provider: .none, status: .none), choice: false).noStorageDetail == nil, "billing off: not about Team")
+        let teamOn = ParaAirCloudBilling(provider: .paddle, status: .none, checkoutAvailable: true)
+        expect(teamDrive(teamOn).controls == [.init(action: .choosePlan, title: "Choose a Plan…", prominent: true)]
+               && teamDrive(teamOn, unpaid: false).controls == [CloudBillingPresentation.choosePlan], "a team that can buy Team offers it")
+        var home = Dictionary(uniqueKeysWithValues: homeScenarios)["22-cloud-no-storage"]!
+        home.cloudUsage = CloudUsage(workspace: fixtureMe(stored: 0, billing: teamOff, kind: "team", unpaid: true).workspaces.first, state: .loaded,
+                                     planChoiceAvailable: true)
+        let homeTeam = HomePresentation.make(home)
+        expect(homeTeam.status.detail == CloudBillingPresentation.teamUnavailable && homeTeam.primary.action == .openInFinder,
+               "the home window says Team isn't available instead of asking the owner to ask the owner")
+        // The same team drive for an owner whose personal workspace already has a plan: nothing can check out.
+        let paidPersonal = ParaAirCloudMe.Workspace(id: "ws_01J9ZX5Q4WJ3M8K2V7N6R1T0YE", name: "Personal", kind: "personal", role: "owner",
+                                                    status: "active", plan: fixturePlan(seats: 1), usage: fixtureUsage(stored: 1), billing: billingActive)
+        let personalPaid = fixtureMe(stored: 0, billing: teamOff, kind: "team", unpaid: true, extra: [paidPersonal])
+        let choiceWhenPaid = personalPaid.workspaces.contains { $0.billing?.checkoutAvailable == true }
+        home.cloudUsage = CloudUsage(workspace: personalPaid.workspaces.first, state: .loaded, planChoiceAvailable: choiceWhenPaid)
+        let homePaid = HomePresentation.make(home)
+        expect(!choiceWhenPaid && home.cloudUsage?.billing.notice?.text == CloudBillingPresentation.teamUnavailable
+               && homePaid.status.detail == CloudBillingPresentation.teamUnavailable && !homePaid.status.detail.contains("Ask the workspace owner"),
+               "a team owner who already pays for Personal is told Team isn't available, not to choose a plan or ask the owner")
+
+        // A team whose plan ended, where Team isn't sold: no Choose a Plan… button, so no "Choose a plan".
+        let teamEnded = ParaAirCloudBilling(provider: .stripe, status: .readOnly, plan: .team, interval: .month, seats: 3,
+                                           currentPeriodEnd: day("2026-10-05"), readOnlyAt: day("2026-10-05"), deletionAt: day("2026-11-04"),
+                                           portalAvailable: true)
+        let readOnlyTeam = teamDrive(teamEnded, unpaid: false, choice: false)
+        expect(readOnlyTeam.notice?.text == "Your team’s plan ended, so this workspace is read-only until November 4, 2026. "
+               + CloudBillingPresentation.teamPlanNotSold + " Copy the files you need out of the drive by then, or they’re deleted."
+               && readOnlyTeam.controls == [CloudBillingPresentation.managePlan], "a read-only team says Team can't be bought, not to choose a plan")
+        var teamPurge = teamEnded
+        teamPurge.status = .pendingDeletion; teamPurge.portalAvailable = false
+        let pendingTeam = teamDrive(teamPurge, unpaid: false, choice: true)
+        expect(pendingTeam.notice?.text == "The read-only period ended on November 4, 2026, so this workspace’s files can be deleted at any time. "
+               + CloudBillingPresentation.teamPlanNotSold + " Copy the files you need out of the drive now." && pendingTeam.controls.isEmpty,
+               "a team pending deletion says Team can't be bought, not to choose a plan")
+        expect(teamDrive(teamEnded, unpaid: false, role: "member").notice?.text.contains("Ask the workspace owner to choose a plan") == true,
+               "a member of the ended team is still sent to the owner")
+        var teamEndedSold = teamEnded
+        teamEndedSold.checkoutAvailable = true
+        expect(teamDrive(teamEndedSold, unpaid: false).notice?.text.contains("Choose a plan by then") == true
+               && teamDrive(teamEndedSold, unpaid: false).controls.first?.action == .choosePlan, "where Team is sold, the owner chooses a plan")
+
+        // The sheet starts on the drive's own plan, and Team seats on what the members use.
+        let both = CloudPlanChoice.make(fixtureMe(stored: 1, billing: billingBeta, extra: [fixtureTeam(billing: billingBeta)]),
+                                        preferredWorkspaceID: teamID, offer: fullOffer)
+        expect(CloudPlanChoice.initialPlan(both, driveKind: "team") == .team && CloudPlanChoice.initialPlan(both, driveKind: "personal") == .personal
+               && CloudPlanChoice.initialPlan(both, driveKind: nil) == .personal, "a team drive starts on Team")
+        expect(CloudPlanChoice.initialPlan(notSoldChoice, driveKind: "team") == .personal, "Team that can't be bought isn't pre-selected")
+        let members = fixtureMembers()
+        expect(CloudPlanChoice.defaultSeats(fixtureTeam(billing: billingBeta, id: members.workspace.id), members: members) == members.workspace.seatsUsed
+               && members.workspace.seatsUsed == 4, "Team seats start at the seats the members use")
+        expect(CloudPlanChoice.defaultSeats(fixtureTeam(billing: billingBeta), members: members) == 1, "another team's list doesn't count")
+        expect(CloudPlanChoice.defaultSeats(nil, members: members) == 1, "no team, one seat")
+
+        var copy = [CloudBillingPresentation.teamUnavailable, notSoldCard.price, notSoldCard.detail, CloudPlanOffer.notSold(.personal).detail,
+                    CloudPlanChoice.notSold(.team), CloudSignOutText.message(UploadActivity(waiting: 1, conflicts: 2)), CloudAccountDeletionText.waitingUploads(2) ?? "",
+                    CloudBillingPresentation.teamPlanNotSold,
+                    SupportLinks.diagnosticsHint]
+        copy += [SupportButtons.CopyState.working, .copied, .failed].compactMap(SupportButtons.line)
+        expect(!copy.joined(separator: "\n").contains("\u{2014}"), "new copy avoids em dashes")
+        return failures
+    }
+
+    /// Copy Diagnostics runs the bundled CLI (review 2026-11-26): what it prints is capped, a helper that hangs is
+    /// stopped, and one that leaves a process holding its output open keeps nothing waiting on the pipe.
+    static func checkDiagnosticsHelper() throws -> [String] {
+        var failures: [String] = []
+        func expect(_ condition: Bool, _ message: String) { if !condition { failures.append("diagnostics helper: " + message) } }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("paraair-ui-helper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        func helper(_ name: String, _ script: String) throws -> URL {
+            let url = folder.appendingPathComponent(name)
+            try ("#!/bin/sh\n" + script + "\n").write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            return url
+        }
+        let run: (URL, [String], TimeInterval, Int) -> SupportDiagnostics.Part = SupportDiagnosticsCollector.run
+
+        let failed = run(try helper("failed", #"printf '{"code":"failed","exitCode":1}'; exit 1"#), ["status", "Team", "--json"], 20, 4 << 20)
+        expect(failed == .json(Data(#"{"code":"failed","exitCode":1}"#.utf8)), "a failing command's JSON is read: \(failed)")
+
+        let big = run(try helper("big", "yes | head -c 5000000"), ["status", "Team", "--json"], 20, SupportDiagnosticsCollector.maxOutputBytes)
+        expect(big == .unavailable("paraair status Team --json printed more than 4 MB, so it was left out."), "output past 4 MB is left out: \(big)")
+
+        var started = Date()
+        let lingering = run(try helper("lingering", "sleep 4 &\nprintf '{}'"), ["setup-status", "--json"], 20, 4 << 20)
+        expect(lingering == .json(Data("{}".utf8)) && Date().timeIntervalSince(started) < 3,
+               "a process left holding stdout delays the reply by about a second, not until it ends: \(lingering), \(Date().timeIntervalSince(started)) s")
+
+        let pidFile = folder.appendingPathComponent("pid")
+        started = Date()
+        let hung = run(try helper("hung", "echo $$ > '\(pidFile.path)'\nexec sleep 30"), ["setup-status", "--json"], 1, 4 << 20)
+        let pid = (try? String(contentsOf: pidFile, encoding: .utf8)).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        expect(hung == .unavailable("paraair setup-status --json didn’t finish within 1 second.") && Date().timeIntervalSince(started) < 4,
+               "a helper that hangs is given up on: \(hung)")
+        expect(pid.map { kill($0, 0) != 0 } == true, "and stopped")
         return failures
     }
 
@@ -813,6 +1006,48 @@ struct UISnapshots {
                    size: CGSize(width: 620, height: 680), appearance: .aqua,
                    to: output.appendingPathComponent("home-33-account-deletion-light.png"))
 
+        // What hasn't uploaded is counted in every drive of the account this Mac knows, not only the selected folder's
+        // (review 2026-11-26): none here and 3 in another state folder still warns.
+        let counted = try model("counted", DeletionBox(fixtureDeletion()))
+        let accountID = counted.signedInAccount?.id ?? ""
+        func cloudDrive(_ name: String, account: String) -> DriveProfile {
+            DriveProfile(name: name, backend: .paraairCloud, blockSize: 4_194_304, displayName: name, cloudIssuer: fixtureIssuer.absoluteString,
+                         cloudAccountID: account, cloudDriveID: fixtureDrives[0].id, cloudWorkspaceID: fixtureWorkspaceID)
+        }
+        let elsewhere = base.appendingPathComponent("counted-elsewhere", isDirectory: true)
+        let foreign = base.appendingPathComponent("counted-foreign", isDirectory: true)
+        let unreadable = base.appendingPathComponent("counted-unreadable", isDirectory: true)
+        try ProfileStore(root: elsewhere).save(cloudDrive("Team-Footage", account: accountID))
+        try ProfileStore(root: foreign).save(cloudDrive("Other-Account", account: UUID().uuidString.lowercased()))
+        try ProfileStore(root: unreadable).save(cloudDrive("Unreadable", account: accountID))
+        let files: [String: Int] = [counted.stateRoot.path: 0, elsewhere.standardizedFileURL.path: 3, foreign.standardizedFileURL.path: 5]
+        let fixtureCount: (DriveProfile, URL) throws -> Int = { _, root in
+            guard let count = files[root.standardizedFileURL.path] else { throw DriveError(EIO, "journal unreadable") }
+            return count
+        }
+        expect(CloudAccountUploads.pending(accountID: accountID, roots: [counted.stateRoot], count: fixtureCount) == 0,
+               "nothing waiting in the account's only drive")
+        expect(CloudAccountUploads.pending(accountID: accountID, roots: [counted.stateRoot, elsewhere, foreign, elsewhere], count: fixtureCount) == 3,
+               "the account's drive in another folder counts, once; another account's doesn't")
+        expect(CloudAccountUploads.pending(accountID: accountID, roots: [counted.stateRoot, elsewhere, unreadable], count: fixtureCount) == nil,
+               "a drive of the account that can't be read makes the count unknown")
+        counted.knownStateRoots = { [elsewhere, foreign] }
+        counted.accountUploadCounter = { CloudAccountUploads.pending(accountID: $0, roots: $1, count: fixtureCount) }
+        counted.presentDeletion()
+        settle { counted.accountPendingUploads != nil }
+        expect(counted.deletion.sheetPresented && counted.accountPendingUploads == 3
+               && CloudAccountDeletionText.waitingUploads(counted.accountPendingUploads)?.hasPrefix("3 files on this Mac haven’t uploaded yet.") == true,
+               "0 waiting here and 3 in another folder of the account: the sheet warns about 3")
+        try render(CloudAccountDeletionSheet(model: counted.deletion, pendingUploads: counted.accountPendingUploads), size: nil, appearance: .aqua,
+                   to: output.appendingPathComponent("deletion-sheet-other-drive-light.png"))
+        counted.deletion.closeSheet()
+        counted.knownStateRoots = { [elsewhere, unreadable] }
+        counted.presentDeletion()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        expect(counted.accountPendingUploads == nil && CloudAccountDeletionText.waitingUploads(counted.accountPendingUploads)?
+               .hasPrefix("Files on this Mac that haven’t uploaded yet") == true, "an unreadable drive of the account: the general warning")
+        counted.deletion.closeSheet()
+
         // Cancel: once, and the banner goes.
         cloud.deletion.cancel()
         busyDone(cloud.deletion)
@@ -909,7 +1144,8 @@ struct UISnapshots {
 
         func model(_ name: String, _ summary: SummaryBox, recorder: BillingRecorder, checkout: [URL] = [stripeCheckout],
                    portal: URL = stripePortal, delay: TimeInterval = 0, workspaceID: String? = fixtureWorkspaceID,
-                   offer: OfferBox = OfferBox(), profileWorkspaceID: String? = nil) throws -> CloudAccountModel {
+                   offer: OfferBox = OfferBox(), profileWorkspaceID: String? = nil,
+                   members: MembersBox = MembersBox(fixtureMembers())) throws -> CloudAccountModel {
             let root = try seedSignedIn(base.appendingPathComponent(name, isDirectory: true), vault: vault, drive: true,
                                         workspaceID: profileWorkspaceID)
             let cloud = CloudAccountModel(
@@ -924,7 +1160,7 @@ struct UISnapshots {
                 },
                 portalStarter: { _, _, _ in portal },
                 offerLoader: { _, _, selection in try offer.offer(selection) },
-                membersService: MembersBox(fixtureMembers()).service, deletionService: DeletionBox(nil).service,
+                membersService: members.service, deletionService: DeletionBox(nil).service,
                 openURL: { recorder.open($0); return true })
             cloud.billingWatchDelays = [0.2, 0.2, 0.2, 0.2]
             cloud.reloadSummary()
@@ -1014,6 +1250,57 @@ struct UISnapshots {
         try render(CloudPlanSheet(model: buyer), size: nil, appearance: .aqua, to: output.appendingPathComponent("plan-paid-light.png"))
         buyer.closePlans()
         expect(!buyer.planSheetPresented && buyer.checkout == .idle, "Done closes the sheet")
+
+        // Stripe Managed Payments doesn't sell Team (review 2026-11-26): from a personal drive the sheet says Team isn't
+        // available yet; from the team's own drive nothing offers the Personal-only sheet.
+        let personalOpen = ParaAirCloudBilling(provider: .stripe, status: .none, checkoutAvailable: true)
+        let teamClosed = ParaAirCloudBilling(provider: .stripe, status: .none)
+        let managedOffer = OfferBox(provider: .stripe, managed: true, sellsTeam: false)
+        let fromPersonal = try model("team-not-sold", SummaryBox(fixtureMe(stored: 1, billing: personalOpen, extra: [fixtureTeam(billing: teamClosed)])),
+                                     recorder: BillingRecorder(), offer: managedOffer)
+        fromPersonal.perform(.choosePlan)
+        settle { offerLoaded(fromPersonal) }
+        expect(fromPersonal.planChoice.team.reason == "Team isn’t available yet." && fromPersonal.planChoice.personal.available,
+               "the sheet sells Personal and says Team isn't available yet")
+        try render(CloudPlanSheet(model: fromPersonal), size: nil, appearance: .aqua, to: output.appendingPathComponent("plan-team-not-sold-light.png"))
+        fromPersonal.closePlans()
+        let personalExtra = ParaAirCloudMe.Workspace(id: "ws_01J9ZX5Q4WJ3M8K2V7N6R1T0YE", name: "Personal", kind: "personal", role: "owner",
+                                                     status: "active", plan: fixtureUnpaidPlan, usage: fixtureUsage(stored: 0), billing: personalOpen)
+        let fromTeam = try model("team-drive-not-sold", SummaryBox(fixtureMe(stored: 0, retained: 0, transfer: 0, billing: teamClosed, kind: "team",
+                                                                              unpaid: true, extra: [personalExtra])),
+                                 recorder: BillingRecorder(), offer: managedOffer)
+        expect(fromTeam.planChoiceAvailable && fromTeam.billing.controls.isEmpty
+               && fromTeam.billing.notice?.text == CloudBillingPresentation.teamUnavailable, "a team drive doesn't offer the Personal-only sheet")
+        try render(ConnectionsView(stateRoot: fromTeam.stateRoot, vault: MemoryVault(), cloudAccount: fromTeam),
+                   size: CGSize(width: 680, height: 800), appearance: .aqua, to: output.appendingPathComponent("storage-billing-team-not-sold-light.png"))
+
+        // Team seats follow the members list when it arrives after the terms loaded: the sheet asks for the terms again
+        // for those seats (the box unticks), and leaves seats the person set alone (review 2026-11-26).
+        let teamOpen = ParaAirCloudBilling(provider: .paddle, status: .none, checkoutAvailable: true)
+        func lateMembers(_ name: String, seats: Int?) throws -> (CloudAccountModel, OfferBox, NSWindow) {
+            let offerBox = OfferBox(provider: .paddle)
+            let cloud = try model(name, SummaryBox(fixtureMe(stored: 0, retained: 0, transfer: 0, billing: teamOpen, kind: "team", unpaid: true)),
+                                  recorder: BillingRecorder(), offer: offerBox)
+            cloud.perform(.choosePlan)
+            settle { offerLoaded(cloud) }
+            cloud.loadQuote(ParaAirCloudOfferRequest(plan: .team, interval: .month, seats: seats ?? 1, workspaceID: fixtureWorkspaceID))
+            settle { if case .loaded = cloud.quote { return true } else { return false } }
+            let window = host(CloudPlanSheet(model: cloud, step: .review, plan: .team, seats: seats, agreed: true))
+            if let workspace = cloud.workspace, let account = cloud.signedInAccount { cloud.members.show(workspace: workspace, account: account) }
+            settle { cloud.members.members != nil }
+            return (cloud, offerBox, window)
+        }
+        func quotedSeats(_ cloud: CloudAccountModel) -> Int? { if case .loaded(let quote) = cloud.quote { return quote.selection.seats } else { return nil } }
+        let (late, lateOffer, lateWindow) = try lateMembers("team-seats-late", seats: nil)
+        settle { quotedSeats(late) == 4 }
+        expect(late.members.members?.workspace.seatsUsed == 4 && lateOffer.requests.last??.seats == 4 && quotedSeats(late) == 4,
+               "the members list arriving after the terms moves Team to the 4 seats its members use, with new terms")
+        lateWindow.close()
+        let (chosen, chosenOffer, chosenWindow) = try lateMembers("team-seats-chosen", seats: 2)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        expect(chosen.members.members != nil && !chosenOffer.requests.contains { $0?.seats == 4 } && quotedSeats(chosen) == 2,
+               "seats the person set stay as they are")
+        chosenWindow.close()
 
         // A new account's free trial with Stripe Managed Payments (operator decisions 2026-10-27): the sheet says so and names
         // Link as the seller, the quote is asked for the workspace, and checkout sends the trial the quote showed.
@@ -2118,6 +2405,19 @@ struct UISnapshots {
 
     // MARK: Rendering
 
+    /// Keeps `view` live in an offscreen window, so it follows its models; close the window when done.
+    @MainActor
+    static func host<V: View>(_ view: V) -> NSWindow {
+        let host = NSHostingView(rootView: view.environment(\.controlActiveState, .key).environment(\.airAmbientMotion, false))
+        host.frame = NSRect(origin: .zero, size: host.fittingSize)
+        let window = KeyLookingWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        return window
+    }
+
     static func suffix(_ appearance: NSAppearance.Name) -> String { appearance == .darkAqua ? "dark" : "light" }
 
     @MainActor
@@ -2190,10 +2490,12 @@ final class BillingRecorder: @unchecked Sendable {
 /// (cloud/src/billing/disclosure.ts, refund Option A) for the snapshot day. `requests` records the selections asked for.
 final class OfferBox: @unchecked Sendable {
     let provider: ParaAirCloudBilling.Provider
-    let version = "A-draft-2026-10-27b"
+    let version = "A-draft-2026-11-26"
     /// Stripe Managed Payments (Link sells), and the free trial a quote for a workspace starts with.
     let managed: Bool
     let trialDays: Int
+    /// False: no Team price in either period, as the service sells through Stripe Managed Payments.
+    let sellsTeam: Bool
     private let prices: [String: Int]
     private let failure: DriveError?
     private let lock = NSLock()
@@ -2202,9 +2504,9 @@ final class OfferBox: @unchecked Sendable {
                                          "storage_month": 1_000, "storage_year": 12_000]
 
     init(provider: ParaAirCloudBilling.Provider = .stripe, prices: [String: Int] = [:], failure: DriveError? = nil, managed: Bool = false,
-         trialDays: Int = 0) {
+         trialDays: Int = 0, sellsTeam: Bool = true) {
         self.provider = provider; self.prices = Self.catalog.merging(prices) { $1 }; self.failure = failure
-        self.managed = managed; self.trialDays = trialDays
+        self.managed = managed; self.trialDays = trialDays; self.sellsTeam = sellsTeam
     }
     var requests: [ParaAirCloudOfferRequest?] { lock.withLock { asked } }
 
@@ -2215,14 +2517,14 @@ final class OfferBox: @unchecked Sendable {
     }
 
     func fixture(_ selection: ParaAirCloudOfferRequest?) -> ParaAirCloudBillingOffer {
-        let ids = ["personal_month", "personal_year", "team_month", "team_year", "storage_month", "storage_year"]
+        let ids = ["personal_month", "personal_year", "team_month", "team_year", "storage_month", "storage_year"].filter { sellsTeam || !$0.hasPrefix("team") }
         let rows = ids.map { id -> ParaAirCloudBillingOffer.Price in
             let parts = id.split(separator: "_").map(String.init)
             return .init(item: id, kind: parts[0] == "storage" ? .storage : .plan, plan: ParaAirCloudBilling.Plan(rawValue: parts[0]),
                          interval: ParaAirCloudBilling.Interval(rawValue: parts[1])!, unitAmountCents: prices[id]!, perMember: parts[0] == "team")
         }
         var quote: ParaAirCloudBillingOffer.Quote?
-        if let selection {
+        if let selection, sellsTeam || selection.plan != .team {
             let unit = prices["\(selection.plan.rawValue)_\(selection.interval.rawValue)"]!, block = prices["storage_\(selection.interval.rawValue)"]!
             let total = unit * (selection.plan == .team ? selection.seats : 1) + block * selection.extraStorageTb
             // The trial applies to a quote for a workspace (the sheet always names one).
@@ -2286,7 +2588,7 @@ final class OfferBox: @unchecked Sendable {
                 + "Cancel before your renewal date to avoid the next charge."
             : "Cancel any time online: in the ParaAir app (Storage Settings > Manage Plan) or at \(account). Cancel before your renewal date "
                 + "to avoid the next charge. You keep access until the end of the \(period) you paid for.")
-        bullets.append("Full refund if you ask within 14 days of \(trial ? "your" : "this") first payment\(yearly ? " or within 14 days of any yearly renewal charge" : "").")
+        bullets.append("Full refund if you ask within 14 days of \(trial ? "your" : "this") first payment (once per person)\(yearly ? " or within 14 days of any yearly renewal charge" : "").")
         bullets.append("We will email you at least 14 days before any price change, and you can cancel first.")
         terms += bullets.map { "- " + $0 }
         let after = trial ? " after the \(trialDays)-day free trial" : ""
@@ -2296,7 +2598,7 @@ final class OfferBox: @unchecked Sendable {
         let legal = UISnapshots.fixtureIssuer.absoluteString + "/legal/"
         let documents = "I agree to the [Terms of Service](\(legal)terms) and the [Subscription, Cancellation and Refund Policy](\(legal)subscription-policy)"
             + "\(team ? ", and I am authorized to agree for this team" : "")."
-        // The short screen's lines (disclosure.ts, A-draft-2026-10-27b).
+        // The short screen's lines (disclosure.ts, A-draft-2026-11-26).
         let price = team ? "\(unit) per member per \(period) plus tax (\(total) for \(s.seats) member\(s.seats == 1 ? "" : "s")"
             + "\(storageTb > 0 ? " and \(storageTb) TB added storage" : ""))" : "\(total) per \(period) plus tax"
         let place = "in ParaAir (Storage Settings > Manage Plan) or at \(account)"
@@ -2305,7 +2607,7 @@ final class OfferBox: @unchecked Sendable {
                              : "\(price), charged today and renewing automatically every \(period) until you cancel.",
                        trial ? "\(who) online before \(firstDay) to pay nothing: \(place)."
                              : "\(who) online any time: \(place). Access lasts until the end of the \(period) paid for.",
-                       "Full refund if you ask within 14 days of \(trial ? "your" : "this") first payment\(yearly ? " or of any yearly renewal charge" : "")."]
+                       "Full refund if you ask within 14 days of \(trial ? "your" : "this") first payment (once per person)\(yearly ? " or of any yearly renewal charge" : "")."]
         if trial { summary.append("If that first payment fails, the plan stops at once: your files become read-only for 30 days, then are deleted.") }
         return (terms, summary, renewal + " " + documents)
     }
