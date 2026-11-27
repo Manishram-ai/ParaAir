@@ -76,39 +76,7 @@
   color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --paper: #0C0D10;
-    --ink: #F6F7F9;
-    --ink-2: #969CA8;
-    --ink-3: #969CA8;
-    --muted: #1A1C20;
-    --rule: #24272C;
-    --card-top: rgb(44 47 54 / 0.6);
-    --card-bottom: rgb(24 26 30 / 0.52);
-    --card-edge: rgb(255 255 255 / 0.08);
-    --card-lip: rgb(255 255 255 / 0.07);
-    --card-shadow: 0 24px 60px -28px rgb(0 0 0 / 0.7), 0 2px 4px rgb(0 0 0 / 0.3);
-    --glass: rgb(255 255 255 / 0.06);
-    --glass-hover: rgb(255 255 255 / 0.11);
-    --glass-edge: rgb(255 255 255 / 0.12);
-    --glass-edge-hover: rgb(255 255 255 / 0.19);
-    --ink-shadow: 0 8px 20px -10px rgb(0 0 0 / 0.7);
-    --piece-off: #23262B;
-    --piece-on: var(--sage);
-    --piece-on-rgb: 154 199 180;
-    --on: #9AC7B4;
-    --outline: #6F7581;
-    --sage-line: #9AC7B4;
-    --rule-strong: #3A3E46;
-    --plane-grey: #5E646F;
-    --plane-fold: #3A3F47;
-    --piece-stored: #5A606B;
-    --focus: #5B9BFF;
-    --grain-opacity: 0.06;
-    color-scheme: dark;
-  }
-}
+/* Light paper only: the site follows the landing page, whatever the Mac's appearance. */
 
 *, *::before, *::after { box-sizing: border-box; }
 html, body { overflow-x: clip; }
@@ -990,3 +958,6 @@ html { scroll-padding-top: 80px; }
   1% { background-color: var(--piece-on); transform: scale(1.45); }
   100% { background-color: var(--piece-on); transform: none; }
 }
+
+/* While the Mac app still carries its old name: one quiet line on the pages that walk through it. */
+.rename-note { max-width: 46ch; margin-top: 14px; padding: 10px 14px; border-radius: 12px; background: var(--muted); color: var(--ink-2); font-size: var(--text-sm); line-height: 1.5; }
