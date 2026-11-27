@@ -492,8 +492,13 @@ public final class Engine {
         parent == "/" || path == parent || path.hasPrefix(parent + "/")
     }
     private func parent(_ path: String) -> String { (path as NSString).deletingLastPathComponent.isEmpty ? "/" : (path as NSString).deletingLastPathComponent }
+    /// Storage can't be asked now: the network, or storage refusing this version of ParaAir until it is updated
+    /// (ParaAir Cloud's 426 `client_too_old`). Either way what this Mac already has answers: cached metadata,
+    /// listings and blocks read as when offline, and pending changes wait. New changes are refused while storage
+    /// refuses this version (refuseIfReadOnly).
     private func isOfflineError(_ error: Error) -> Bool {
         guard let code = (error as? DriveError)?.code else { return false }
+        if code == ENOTSUP { return ParaAirCloudOutcome.of(error) == .updateRequired }
         return [EIO, ENETDOWN, ENETUNREACH, EHOSTUNREACH, ECONNRESET, ECONNREFUSED, ETIMEDOUT, ENOTCONN].contains(code)
     }
     /// Records metadata learned from a publication or namespace change.
@@ -822,7 +827,7 @@ public final class Engine {
 
     @discardableResult public func write(_ value: String, offset: Int64, data: Data) throws -> Int {
         let path = try canonicalPath(value)
-        try refuseIfOwnedElsewhere(path)
+        try refuseIfReadOnly(path)
         let wrote: Int = try withWritableJournal(path) { pending in
             guard offset >= 0, data.count <= 64 * 1024 * 1024, offset <= Int64.max - Int64(data.count) else {
                 throw DriveError(EINVAL, "Invalid write range (maximum 64 MiB per call)")
@@ -847,15 +852,19 @@ public final class Engine {
     }
     public func create(_ value: String, directory: Bool) throws -> FileEntry {
         let path = try canonicalPath(value)
-        try refuseIfOwnedElsewhere(path)
+        try refuseIfReadOnly(path)
         if Housekeeping.isRefused(path) || (directory && Housekeeping.isLocalOnly(path)) {
             throw DriveError(EACCES, "macOS system folders are not stored on this drive")
         }
-        // Existence checks may refresh metadata, so they run before the state lock.
-        do { _ = try stat(path); throw DriveError(EEXIST, "Path already exists") }
-        catch let error as DriveError where error.code == ENOENT {} // Only a confirmed missing path permits creation.
-        if !directory { guard try stat(parent(path)).kind == .directory else { throw DriveError(ENOTDIR, "Parent is not a directory") } }
+        // Existence checks may refresh metadata, so they run before the state lock. Storage refusing this version
+        // on the way makes the drive read-only (refuseIfUpdateRequired), not a failed lookup.
+        try readOnlyIfRefused(path) {
+            do { _ = try stat(path); throw DriveError(EEXIST, "Path already exists") }
+            catch let error as DriveError where error.code == ENOENT {} // Only a confirmed missing path permits creation.
+            if !directory { guard try stat(parent(path)).kind == .directory else { throw DriveError(ENOTDIR, "Parent is not a directory") } }
+        }
         return try lock.withLock {
+            try refuseIfUpdateRequired(path)
             if let _: Journal = try db.get("journal", path) { throw DriveError(EEXIST, "Path already exists") }
             namespaceEpoch &+= 1
             if directory {
@@ -873,7 +882,7 @@ public final class Engine {
     }
     public func truncate(_ value: String, size: Int64) throws {
         let path = try canonicalPath(value)
-        try refuseIfOwnedElsewhere(path)
+        try refuseIfReadOnly(path)
         try withWritableJournal(path, cleansUp: true) { pending in
             guard size >= 0 else { throw DriveError(EINVAL, "Negative file size") }
             try ensureJournalSpace(0, drainable: true)
@@ -889,11 +898,14 @@ public final class Engine {
     private func withWritableJournal<T>(_ path: String, cleansUp: Bool = false, _ body: (inout Journal) throws -> T) throws -> T {
         var drains = 0, missing = 0, copies = 0
         while true {
-            // A new journal's base comes from metadata refreshed outside the state lock.
-            let fetched = try refreshMetadataIfNeeded(path, force: missing > 0)
+            // A new journal's base comes from metadata refreshed outside the state lock. That refresh, or an upload
+            // or commit check below, may be what learns that storage refuses this version: checked again under the
+            // lock on every pass, before the journal changes.
+            let fetched = try readOnlyIfRefused(path) { try refreshMetadataIfNeeded(path, force: missing > 0) }
             let access: JournalAccess<T>
             do {
                 access = try lock.withLock {
+                    try refuseIfUpdateRequired(path)
                     let save = { (journal: Journal) in
                         try self.db.transaction { try self.db.put("journal", path, journal); try self.invalidatePins(under: path) }
                         if cleansUp { try self.recoverOrphans() }
@@ -1264,7 +1276,7 @@ public final class Engine {
     }
     public func move(_ source: String, to destination: String) throws {
         let from = try canonicalPath(source), to = try canonicalPath(destination)
-        try refuseIfOwnedElsewhere(from)
+        try refuseIfReadOnly(from)
         if Housekeeping.isRefused(from) { throw DriveError(ENOENT, "No such file") }
         if Housekeeping.isRefused(to) { throw DriveError(EACCES, "macOS system folders are not stored on this drive") }
         let localFrom = Housekeeping.isLocalOnly(from), localTo = Housekeeping.isLocalOnly(to)
@@ -1295,7 +1307,7 @@ public final class Engine {
     }
     public func remove(_ value: String, directory: Bool) throws {
         let path = try canonicalPath(value)
-        try refuseIfOwnedElsewhere(path)
+        try refuseIfReadOnly(path)
         guard path != "/" else { throw DriveError(EBUSY, "Cannot remove the drive root") }
         if Housekeeping.staysLocal(path) {
             try lock.withLock {
@@ -1669,7 +1681,7 @@ public final class Engine {
         }
         let target = try canonicalPath((parent(path) == "/" ? "" : parent(path)) + "/" + name)
         guard target != path, !Housekeeping.staysLocal(target) else { throw DriveError(EINVAL, "Choose another name for your copy") }
-        try refuseIfOwnedElsewhere(target)
+        try refuseIfReadOnly(target)
         do { _ = try stat(target); throw DriveError(EEXIST, "Something named “\(name)” is already in this folder") }
         catch let error as DriveError where error.code == ENOENT {}
         do { guard try stat(parent(target)).kind == .directory else { throw DriveError(ENOTDIR, "The file’s folder is gone") } }
@@ -1686,6 +1698,7 @@ public final class Engine {
             // The version in storage the change lost to, recorded with the copy before its base is cleared.
             let theirs = (try? backend.stat(path)).flatMap { $0.kind == .file ? $0.version : nil }
             return try lock.withLock {
+                try refuseIfUpdateRequired(target)
                 guard let current: Journal = try db.get("journal", path), unchanged(current, since: item) else {
                     throw DriveError(EBUSY, "The file changed meanwhile, and its newer change is kept. Try again.")
                 }
@@ -2248,12 +2261,33 @@ public final class Engine {
         return IndexBackupStatus(lastBackupNanoseconds: state.lastBackupAt, pendingSinceNanoseconds: state.firstChangeAt,
                                  lastError: state.lastError, lastErrno: state.lastErrno)
     }
-    /// Refuses a change once another Mac owns the drive. Housekeeping stays local, so it is
-    /// never refused.
-    private func refuseIfOwnedElsewhere(_ path: String) throws {
-        guard !Housekeeping.staysLocal(path), let owner = try ownedElsewhere(refresh: false) else { return }
+    /// Refuses a change while storage refuses this version of ParaAir (it couldn't upload, and the person should
+    /// update rather than pile up changes only this Mac has), and once another Mac owns the drive. Housekeeping stays
+    /// local, so it is never refused.
+    private func refuseIfReadOnly(_ path: String) throws {
+        guard !Housekeeping.staysLocal(path) else { return }
+        try refuseIfUpdateRequired(path)
+        guard let owner = try ownedElsewhere(refresh: false) else { return }
         throw DriveError(EROFS, "This drive is now used on \(owner.ownerName ?? "another Mac"). It’s read-only on this Mac.")
     }
+    /// EROFS while storage refuses this version of ParaAir. Without I/O, so it can run under the state lock: a change
+    /// checks again there, right before the journal changes, because a metadata refresh, an upload or a commit check
+    /// on the way may be what learned of the refusal (the cached fallback then hides it from the caller).
+    private func refuseIfUpdateRequired(_ path: String) throws {
+        guard !Housekeeping.staysLocal(path), backend.updateRequired() else { return }
+        throw DriveError(EROFS, Self.updateRequiredMessage)
+    }
+    /// Runs a lookup a change depends on; storage refusing this version there (ENOTSUP, nothing cached to fall back
+    /// on) refuses the change as read-only, like refuseIfUpdateRequired.
+    private func readOnlyIfRefused<T>(_ path: String, _ body: () throws -> T) throws -> T {
+        do { return try body() }
+        catch let error as DriveError where error.code == ENOTSUP && !Housekeeping.staysLocal(path)
+                                          && ParaAirCloudOutcome.of(error) == .updateRequired {
+            throw DriveError(EROFS, Self.updateRequiredMessage)
+        }
+    }
+    /// Starts with the service's own message, so ParaAirCloudOutcome reads it as `.updateRequired`.
+    static let updateRequiredMessage = ParaAirCloudErrorCode.clientTooOld.message + ". Until then, this drive is read-only on this Mac."
     /// Whether another Mac owns this drive. After 10 s, asks storage, which answers from its
     /// last check without the network; with `refresh`, storage reads the owner record now.
     /// Offline or unconnected, the saved answer stands. Changes are saved for other
