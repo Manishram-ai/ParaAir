@@ -44,7 +44,7 @@ import xml.etree.ElementTree as ET
 ORIGIN = "https://paraair.parafield.ai"
 HOST = urlsplit(ORIGIN).netloc
 REQUIRED = ["index.html", "pricing.html", "get-started.html", "styles.css", "motion.js", "signup.js", "home.css", "home.js",
-            "story.js", "hero.css", "hero.js", "pricing.css", "_headers",
+            "story.js", "hero.css", "hero.js", "pricing.css", "fonts/fredoka-latin.woff2", "fonts/fredoka-latin-ext.woff2", "_headers",
             "favicon.ico", "og-card.png", "robots.txt", "sitemap.xml", ".well-known/security.txt"]
 EM_DASH = "—"  # em dash
 BANNED_WORDS = re.compile(r"\bunlimited\b", re.IGNORECASE)
